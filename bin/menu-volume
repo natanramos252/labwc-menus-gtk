@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Menu de volume da barra (labwc), no estilo do GNOME e no visual do menu-wifi.
+
+Volume e microfone com controle deslizante e botão de mudo, escolha da saída
+(alto-falantes, fones, HDMI, Bluetooth...) e atalho para o pavucontrol.
+Fecha ao clicar de novo no volume, ao clicar em outra janela ou com Esc.
+Teste: MENU_TESTE=1 mantém aberto mesmo sem foco.
+"""
+import os
+import re
+import subprocess
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "org.labwc.MenuVolume"
+GLib.set_prgname(APP_ID)
+TITULO = "Volume"  # usado na regra de janela do rc.xml
+CLOSED_STAMP = os.path.join(GLib.get_user_runtime_dir(), "menu-volume.closed")
+TESTE = os.environ.get("MENU_TESTE")
+C = dict(os.environ, LANG="C", LC_ALL="C")
+
+CSS = b"""
+window.menu-volume { background-color: transparent; }
+#menu {
+  background-color: rgba(24, 24, 34, 0.985);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 12px;
+}
+#menu, #menu label, #menu image { color: #e6e6e6; }
+#menu .dim { color: #9a9aa8; font-size: 12px; }
+#menu .titulo { font-weight: bold; }
+#menu button {
+  background: transparent; border: none; box-shadow: none;
+  border-radius: 18px; padding: 6px; color: #e6e6e6;
+}
+#menu button:hover { background-color: rgba(255, 255, 255, 0.10); }
+#menu button.mudo { background-color: rgba(247, 118, 142, 0.25); }
+#menu button.texto { border-radius: 8px; padding: 6px 10px; }
+#menu scale trough { background-color: rgba(255, 255, 255, 0.15); min-height: 6px; border-radius: 3px; }
+#menu scale highlight { background-color: #7aa2f7; border-radius: 3px; }
+#menu scale slider { background-color: #ffffff; min-width: 18px; min-height: 18px; border-radius: 9px; }
+#menu list { background: transparent; }
+#menu row { padding: 6px 10px; border-radius: 8px; }
+#menu row:hover { background-color: rgba(255, 255, 255, 0.08); }
+#menu .separador { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; margin: 6px 2px; }
+"""
+
+
+def rodar(*cmd):
+    """Executa um comando em inglês (LANG=C) e devolve a saída, para o texto ser previsível."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, env=C, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def ler_volume(alvo):
+    """Lê volume (0–1) e se está mudo, via wpctl."""
+    saida = rodar("wpctl", "get-volume", alvo)
+    m = re.search(r"([\d.]+)", saida)
+    return (float(m.group(1)) if m else 0.0), ("MUTED" in saida)
+
+
+def icone_volume(vol, mudo, microfone=False):
+    """Escolhe o ícone conforme o volume/mudo (alto-falante ou microfone)."""
+    if microfone:
+        return "microphone-sensitivity-muted-symbolic" if mudo else "audio-input-microphone-symbolic"
+    if mudo or vol <= 0:
+        return "audio-volume-muted-symbolic"
+    return ("audio-volume-low-symbolic" if vol < 0.34 else
+            "audio-volume-medium-symbolic" if vol < 0.67 else "audio-volume-high-symbolic")
+
+
+def saidas():
+    """Lista (sink, porta, descrição, disponível) e qual é a atual."""
+    padrao = rodar("pactl", "get-default-sink").strip()
+    itens, atual = [], None
+    sink = desc = porta_ativa = None
+    em_portas = False
+    for linha in rodar("pactl", "list", "sinks").splitlines():
+        s = linha.strip()
+        if s.startswith("Name:"):
+            sink, em_portas = s.split(":", 1)[1].strip(), False
+        elif s.startswith("Description:"):
+            desc = s.split(":", 1)[1].strip()
+        elif s == "Ports:":
+            em_portas = True
+        elif s.startswith("Active Port:"):
+            porta_ativa = s.split(":", 1)[1].strip()
+            if sink == padrao:
+                atual = (sink, porta_ativa)
+            em_portas = False
+        elif em_portas and ":" in s and "(" in s:
+            porta, resto = s.split(":", 1)
+            nome = resto.split("(")[0].strip()
+            disponivel = "not available" not in resto
+            itens.append((sink, porta.strip(), nome or desc, disponivel, desc))
+    # sinks sem portas (Bluetooth, HDMI virtual...) entram pelo nome do dispositivo
+    vistos = {i[0] for i in itens}
+    sink = desc = None
+    for linha in rodar("pactl", "list", "sinks").splitlines():
+        s = linha.strip()
+        if s.startswith("Name:"):
+            sink = s.split(":", 1)[1].strip()
+        elif s.startswith("Description:") and sink not in vistos:
+            itens.append((sink, None, s.split(":", 1)[1].strip(), True, ""))
+            vistos.add(sink)
+            if sink == padrao and atual is None:
+                atual = (sink, None)
+    return itens, atual
+
+
+class MenuVolume(Gtk.Application):
+    """Menu do volume: saída, microfone, escolha da saída de som e pavucontrol."""
+    def __init__(self):
+        """Prepara o app de instância única."""
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win = None
+
+    def do_activate(self):
+        """Abre o menu; se já estiver aberto (clique de novo no volume), fecha."""
+        if self.win is not None:  # clicou de novo no volume: fecha
+            self.fechar()
+            return
+        try:  # o clique que tirou o foco já fechou o menu: não reabrir
+            if time.time() - os.path.getmtime(CLOSED_STAMP) < 0.4:
+                self.quit()
+                return
+        except OSError:
+            pass
+        self.construir()
+
+    def fechar(self, marcar=False):
+        """Fecha o menu. Com marcar=True, anota a hora para o clique que tirou o foco não reabri-lo."""
+        if marcar:
+            try:
+                with open(CLOSED_STAMP, "w"):
+                    pass
+            except OSError:
+                pass
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+        self.quit()
+
+    # ---------- interface ----------
+    def controle(self, alvo, microfone=False):
+        """Linha com botão de mudo, controle deslizante e porcentagem."""
+        vol, mudo = ler_volume(alvo)
+        caixa = Gtk.Box(spacing=8)
+        botao = Gtk.Button()
+        img = Gtk.Image.new_from_icon_name(icone_volume(vol, mudo, microfone), Gtk.IconSize.BUTTON)
+        botao.add(img)
+        botao.set_tooltip_text("Ativar/desativar o microfone" if microfone else "Sem som")
+        if mudo:
+            botao.get_style_context().add_class("mudo")
+        escala = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        escala.set_draw_value(False)
+        escala.set_value(round(vol * 100))
+        escala.set_hexpand(True)
+        porcento = Gtk.Label(label=f"{round(vol * 100)}%")
+        porcento.set_width_chars(4)
+        porcento.get_style_context().add_class("dim")
+        estado = {"mudo": mudo}
+
+        def atualizar_icone():
+            """Atualiza o ícone e o destaque vermelho do mudo."""
+            v = escala.get_value() / 100
+            img.set_from_icon_name(icone_volume(v, estado["mudo"], microfone), Gtk.IconSize.BUTTON)
+            ctx = botao.get_style_context()
+            (ctx.add_class if estado["mudo"] else ctx.remove_class)("mudo")
+
+        def ao_mover(w):
+            """Ao arrastar: muda o volume na hora e tira do mudo (como no GNOME)."""
+            v = int(w.get_value())
+            porcento.set_text(f"{v}%")
+            rodar("wpctl", "set-volume", alvo, f"{v / 100:.2f}")
+            if estado["mudo"] and v > 0:  # mexer no volume tira do mudo, como no GNOME
+                rodar("wpctl", "set-mute", alvo, "0")
+                estado["mudo"] = False
+            atualizar_icone()
+
+        def ao_mudo(_b):
+            """Botão de mudo: alterna."""
+            estado["mudo"] = not estado["mudo"]
+            rodar("wpctl", "set-mute", alvo, "1" if estado["mudo"] else "0")
+            atualizar_icone()
+
+        escala.connect("value-changed", ao_mover)
+        botao.connect("clicked", ao_mudo)
+        caixa.pack_start(botao, False, False, 0)
+        caixa.pack_start(escala, True, True, 0)
+        caixa.pack_start(porcento, False, False, 0)
+        return caixa
+
+    def separador(self):
+        """Linha fina horizontal."""
+        s = Gtk.Box()
+        s.get_style_context().add_class("separador")
+        return s
+
+    def construir(self):
+        """Monta a janela sem moldura no visual dos menus."""
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+
+        win = self.win = Gtk.ApplicationWindow(application=self, title=TITULO)
+        win.get_style_context().add_class("menu-volume")
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_app_paintable(True)
+        visual = win.get_screen().get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+
+        raiz = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        raiz.set_name("menu")
+        raiz.set_size_request(300, -1)
+        win.add(raiz)
+
+        raiz.pack_start(self.controle("@DEFAULT_AUDIO_SINK@"), False, False, 0)
+        raiz.pack_start(self.controle("@DEFAULT_AUDIO_SOURCE@", microfone=True), False, False, 0)
+        raiz.pack_start(self.separador(), False, False, 0)
+
+        titulo = Gtk.Label(label="Saída de som", xalign=0)
+        titulo.get_style_context().add_class("dim")
+        titulo.set_margin_start(4)
+        raiz.pack_start(titulo, False, False, 0)
+        lista = Gtk.ListBox()
+        lista.set_selection_mode(Gtk.SelectionMode.NONE)
+        itens, atual = saidas()
+        self.marcas = []
+        for sink, porta, nome, disponivel, _desc in itens:
+            row = Gtk.ListBoxRow()
+            row.saida = (sink, porta)
+            caixa = Gtk.Box(spacing=10)
+            icone = "audio-headphones-symbolic" if porta and "headphone" in porta else \
+                "video-display-symbolic" if porta and "hdmi" in porta else \
+                "bluetooth-active-symbolic" if sink.startswith("bluez") else "audio-speakers-symbolic"
+            caixa.pack_start(Gtk.Image.new_from_icon_name(icone, Gtk.IconSize.MENU), False, False, 0)
+            rot = Gtk.Label(label=nome + ("" if disponivel else "  (desconectado)"), xalign=0)
+            if not disponivel:
+                rot.get_style_context().add_class("dim")
+            caixa.pack_start(rot, True, True, 0)
+            marca = Gtk.Image.new_from_icon_name("object-select-symbolic", Gtk.IconSize.MENU)
+            marca.set_opacity(1.0 if atual == (sink, porta) else 0.0)
+            self.marcas.append((row.saida, marca))
+            caixa.pack_end(marca, False, False, 0)
+            row.add(caixa)
+            lista.add(row)
+        lista.connect("row-activated", self.ao_escolher_saida)
+        raiz.pack_start(lista, False, False, 0)
+        raiz.pack_start(self.separador(), False, False, 0)
+
+        config = Gtk.Button(label="Configurações de som…")
+        config.get_style_context().add_class("texto")
+        config.get_child().set_xalign(0)
+        config.connect("clicked", self.ao_configurar)
+        raiz.pack_start(config, False, False, 0)
+
+        win.connect("key-press-event", self.ao_tecla)
+        win.connect("focus-out-event", lambda *a: (not TESTE) and self.fechar(marcar=True))
+        win.show_all()
+
+    # ---------- ações ----------
+    def ao_escolher_saida(self, _lista, row):
+        """Troca a saída de som (dispositivo e porta, ex.: fones ou alto-falantes)."""
+        sink, porta = row.saida
+        rodar("pactl", "set-default-sink", sink)
+        if porta:
+            rodar("pactl", "set-sink-port", sink, porta)
+        for saida, marca in self.marcas:
+            marca.set_opacity(1.0 if saida == (sink, porta) else 0.0)
+
+    def ao_configurar(self, _b):
+        """Abre o pavucontrol e fecha o menu."""
+        subprocess.Popen(["pavucontrol"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.fechar()
+
+    def ao_tecla(self, _w, ev):
+        """Esc fecha."""
+        if ev.keyval == Gdk.KEY_Escape:
+            self.fechar()
+            return True
+        return False
+
+
+if __name__ == "__main__":
+    MenuVolume().run(None)

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Configurações (labwc)
+Comment=Rede, som, tela, mouse, teclado, aparência e sistema
+Exec=configuracoes
+Icon=preferences-system
+Categories=Settings;
+# Aparece só na sessão labwc (XDG_CURRENT_DESKTOP=wlroots); no GNOME continua o Settings original.
+OnlyShowIn=wlroots;
+StartupWMClass=org.labwc.Configuracoes

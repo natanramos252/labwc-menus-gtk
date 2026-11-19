@@ -1,0 +1,65 @@
+// Exemplo de barra superior do Waybar usando os menus deste repositório.
+// Copie os módulos que quiser para o seu ~/.config/waybar/config.
+// Os ícones (\uf00a, \uf011, \uf287) vêm da fonte Font Awesome (pacote fonts-font-awesome).
+[
+  {
+    "name": "topo",
+    "layer": "top",
+    "position": "top",
+    "height": 26,
+    "modules-left": [
+      "custom/apps"
+    ],
+    "modules-center": [
+      "custom/relogio"
+    ],
+    "modules-right": [
+      "custom/dispositivos",
+      "pulseaudio",
+      "network",
+      "battery",
+      "tray",
+      "custom/power"
+    ],
+    "custom/apps": {
+      "format": "  Aplicativos",
+      "tooltip": false,
+      "on-click": "~/.local/bin/menu-iniciar"
+    },
+    "custom/relogio": {
+      "exec": "~/.local/bin/relogio-barra",
+      "interval": 5,
+      "on-click": "~/.local/bin/menu-calendario",
+      "return-type": "json",
+      "signal": 10
+    },
+    "pulseaudio": {
+      "format": "vol {volume}%",
+      "format-muted": "mudo",
+      "on-click": "~/.local/bin/menu-volume",
+      "on-click-right": "pavucontrol",
+      "tooltip-format": "Clique: volume e saída · Botão direito: mixer · Roda do mouse: ajustar"
+    },
+    "network": {
+      "format-wifi": "wifi {essid}",
+      "format-ethernet": "cabo",
+      "format-disconnected": "offline",
+      "on-click": "~/.local/bin/menu-wifi",
+      "on-click-right": "nm-connection-editor",
+      "tooltip-format-wifi": "{essid} — sinal {signalStrength}%\nClique: trocar rede · Botão direito: configurações",
+      "tooltip-format-disconnected": "Sem conexão\nClique para escolher uma rede"
+    },
+    "custom/dispositivos": {
+      "exec": "~/.local/bin/menu-dispositivos estado",
+      "return-type": "json",
+      "interval": 3,
+      "signal": 11,
+      "on-click": "~/.local/bin/menu-dispositivos"
+    },
+    "custom/power": {
+      "format": "",
+      "tooltip": false,
+      "on-click": "~/.local/bin/menu-energia"
+    }
+  }
+]

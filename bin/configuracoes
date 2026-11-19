@@ -1,0 +1,1001 @@
+#!/usr/bin/env python3
+"""Configurações para a sessão labwc, no mesmo visual dos menus.
+
+Ajusta na hora o que o labwc controla (mouse, touchpad, teclado, papel de
+parede, brilho, volume, tema) e abre a ferramenta certa para o resto
+(Wi-Fi, Bluetooth, impressoras, monitores, usuários...).
+
+O que é do labwc fica num bloco marcado do rc.xml, gerado a partir de
+~/.config/labwc/configuracoes.json. Teste: CONFIG_PAGINA=<id> abre numa seção.
+"""
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "org.labwc.Configuracoes"
+GLib.set_prgname(APP_ID)
+HOME = os.path.expanduser("~")
+LABWC = os.path.join(HOME, ".config/labwc")
+RC = os.path.join(LABWC, "rc.xml")
+ESTADO = os.path.join(LABWC, "configuracoes.json")
+AMBIENTE = os.path.join(LABWC, "environment")
+AUTOSTART = os.path.join(LABWC, "autostart")
+WALLPAPERS = os.path.join(HOME, "Imagens/wallpapers")
+INICIO, FIM = "<!-- configuracoes:inicio", "<!-- configuracoes:fim -->"
+
+PADRAO = {
+    "touchpad": {"tap": True, "natural": False, "velocidade": 0.0, "dwt": True, "clique": "buttonAreas"},
+    "mouse": {"natural": False, "velocidade": 0.0, "aceleracao": "adaptive"},
+    "teclado": {"repeticao": 25, "atraso": 600},
+    "energia": {"bloquear": 10, "tela": 0, "suspender": 0},
+    "notificacoes": {"nao_perturbe": False, "duracao": 5, "posicao": "top-right"},
+}
+LAYOUTS = [
+    ("br", "", "Português (Brasil, ABNT2)"),
+    ("us", "", "Inglês (EUA)"),
+    ("us", "intl", "Inglês (EUA, internacional com acentos)"),
+    ("br,us", "", "ABNT2 + EUA (alternar com Alt+Shift)"),
+]
+CORES = ["Blue", "Green", "Grey", "Orange", "Purple", "Red", "Yellow", "Brown"]
+CORES_PT = {"Blue": "Azul", "Green": "Verde", "Grey": "Cinza", "Orange": "Laranja",
+            "Purple": "Roxo", "Red": "Vermelho", "Yellow": "Amarelo", "Brown": "Marrom"}
+
+CSS = b"""
+window.configuracoes, window.configuracoes headerbar { background-color: #181822; color: #e6e6e6; }
+window.configuracoes headerbar { border: none; box-shadow: none; min-height: 40px; }
+window.configuracoes headerbar .title { font-weight: bold; }
+.configuracoes label, .configuracoes image { color: #e6e6e6; }
+.configuracoes .dim { color: #9a9aa8; font-size: 12px; }
+.configuracoes .titulo-pagina { font-size: 20px; font-weight: bold; }
+.configuracoes .lateral { background-color: #14141c; }
+.configuracoes .lateral row { padding: 7px 12px; border-radius: 8px; margin: 1px 6px; }
+.configuracoes .lateral row:hover { background-color: rgba(255,255,255,0.06); }
+.configuracoes .lateral row:selected,
+.configuracoes .lateral row:selected:focus,
+.configuracoes .lateral row:selected:hover { background-color: #2b3550; background-image: none; }
+.configuracoes .lateral row:selected label,
+.configuracoes .lateral row:selected image { color: #ffffff; }
+.configuracoes .cartao {
+  background-color: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+}
+.configuracoes .linha { padding: 10px 14px; }
+.configuracoes .sep { background-color: rgba(255,255,255,0.07); min-height: 1px; }
+.configuracoes button {
+  background: rgba(255,255,255,0.08); border: none; box-shadow: none;
+  border-radius: 8px; padding: 5px 12px; color: #e6e6e6;
+}
+.configuracoes button:hover { background: rgba(255,255,255,0.14); }
+.configuracoes button.miniatura { padding: 3px; background: transparent; border: 2px solid transparent; }
+.configuracoes button.miniatura.atual { border-color: #7aa2f7; }
+.configuracoes button.cor { min-width: 26px; min-height: 26px; padding: 0; border-radius: 14px; border: 2px solid transparent; }
+.configuracoes button.cor.atual { border-color: #ffffff; }
+.configuracoes scale trough { background-color: rgba(255,255,255,0.15); min-height: 4px; }
+.configuracoes scale highlight { background-color: #7aa2f7; }
+.configuracoes scale slider { background-color: #e6e6e6; min-width: 16px; min-height: 16px; }
+.configuracoes combobox button { padding: 4px 10px; }
+"""
+CORES_HEX = {"Blue": "#3584e4", "Green": "#3fa66b", "Grey": "#8a8f98", "Orange": "#e66d2e",
+             "Purple": "#9141ac", "Red": "#d93a3a", "Yellow": "#e5a50a", "Brown": "#986a44"}
+
+
+# ---------------------------------------------------------------- utilidades
+def rodar(*cmd, env=None):
+    """Executa um comando e devolve o resultado (ou None se falhar), sem travar a interface por mais de 10 s."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def abrir(*cmd, gnome=False):
+    """Abre um programa separado deste app. Com gnome=True, finge ser o GNOME
+    (necessário para o gnome-control-center abrir fora do GNOME).
+    """
+    env = dict(os.environ)
+    if gnome:
+        env["XDG_CURRENT_DESKTOP"] = "GNOME"
+    try:
+        subprocess.Popen(cmd, env=env, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def tem(programa):
+    """Diz se um programa está instalado (existe no PATH)."""
+    return shutil.which(programa) is not None
+
+
+def ler_estado():
+    """Lê as escolhas salvas (configuracoes.json), completando com os valores padrão."""
+    estado = json.loads(json.dumps(PADRAO))
+    try:
+        salvo = json.load(open(ESTADO))
+        for grupo, valores in salvo.items():
+            estado.setdefault(grupo, {}).update(valores)
+    except (OSError, ValueError):
+        pass
+    return estado
+
+
+def sim(v):
+    """Converte True/False para o 'yes'/'no' que o rc.xml do labwc espera."""
+    return "yes" if v else "no"
+
+
+def aplicar_labwc(estado):
+    """Grava o bloco gerado no rc.xml e recarrega o labwc."""
+    json.dump(estado, open(ESTADO, "w"), indent=2)
+    t, m, k = estado["touchpad"], estado["mouse"], estado["teclado"]
+    bloco = f"""  {INICIO} (gerado pelo app Configurações; não edite à mão) -->
+  <keyboard>
+    <repeatRate>{int(k['repeticao'])}</repeatRate>
+    <repeatDelay>{int(k['atraso'])}</repeatDelay>
+  </keyboard>
+  <libinput>
+    <device category="touchpad">
+      <tap>{sim(t['tap'])}</tap>
+      <naturalScroll>{sim(t['natural'])}</naturalScroll>
+      <pointerSpeed>{t['velocidade']:.2f}</pointerSpeed>
+      <disableWhileTyping>{sim(t['dwt'])}</disableWhileTyping>
+      <clickMethod>{t['clique']}</clickMethod>
+    </device>
+    <device category="non-touch">
+      <naturalScroll>{sim(m['natural'])}</naturalScroll>
+      <pointerSpeed>{m['velocidade']:.2f}</pointerSpeed>
+      <accelProfile>{m['aceleracao']}</accelProfile>
+    </device>
+  </libinput>
+  {FIM}
+"""
+    texto = open(RC).read()
+    padrao = re.compile(r"  " + re.escape(INICIO) + r".*?" + re.escape(FIM) + r"\n", re.S)
+    if padrao.search(texto):
+        texto = padrao.sub(lambda _m: bloco, texto)
+    else:
+        texto = texto.replace("</labwc_config>", bloco + "</labwc_config>")
+    tmp = RC + ".tmp"
+    open(tmp, "w").write(texto)
+    os.replace(tmp, RC)
+    rodar("labwc", "--reconfigure")
+
+
+def ler_ambiente():
+    """Lê ~/.config/labwc/environment (variáveis como o layout do teclado) para um dicionário."""
+    linhas = {}
+    try:
+        for linha in open(AMBIENTE):
+            if "=" in linha and not linha.lstrip().startswith("#"):
+                chave, valor = linha.rstrip("\n").split("=", 1)
+                linhas[chave] = valor
+    except OSError:
+        pass
+    return linhas
+
+
+def gravar_ambiente(linhas):
+    """Grava o dicionário de volta no arquivo environment do labwc (vale no próximo login)."""
+    with open(AMBIENTE, "w") as f:
+        for chave, valor in linhas.items():
+            if valor != "":
+                f.write(f"{chave}={valor}\n")
+
+
+def papel_atual():
+    """Descobre no autostart qual imagem está como papel de parede."""
+    try:
+        m = re.search(r"swaybg -i (\S+)", open(AUTOSTART).read())
+        return os.path.expanduser(m.group(1)) if m else None
+    except OSError:
+        return None
+
+
+def trocar_papel(caminho):
+    """Troca o papel de parede: atualiza o autostart e reinicia o swaybg na hora."""
+    texto = open(AUTOSTART).read()
+    rel = caminho.replace(HOME, "~", 1)
+    texto = re.sub(r"swaybg -i \S+", lambda _m: f"swaybg -i {rel}", texto, count=1)
+    open(AUTOSTART, "w").write(texto)
+    rodar("pkill", "-x", "swaybg")
+    abrir("swaybg", "-i", caminho, "-m", "fill")
+
+
+# ---------------------------------------------------------------- componentes
+def rotulo(texto, classe=None, xalign=0.0, quebra=False):
+    """Cria um texto (Gtk.Label) com classe CSS opcional e quebra de linha opcional."""
+    lab = Gtk.Label(label=texto, xalign=xalign)
+    if quebra:
+        lab.set_line_wrap(True)
+        lab.set_max_width_chars(60)
+    if classe:
+        lab.get_style_context().add_class(classe)
+    return lab
+
+
+def cartao(*linhas):
+    """Agrupa várias linhas num 'cartão' arredondado com separadores, como no GNOME Settings."""
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    box.get_style_context().add_class("cartao")
+    for i, linha in enumerate(linhas):
+        if i:
+            sep = Gtk.Box()
+            sep.get_style_context().add_class("sep")
+            box.pack_start(sep, False, False, 0)
+        box.pack_start(linha, False, False, 0)
+    return box
+
+
+def linha(titulo, widget=None, sub=None):
+    """Uma linha de configuração: título (e subtítulo) à esquerda e o controle à direita."""
+    box = Gtk.Box(spacing=12)
+    box.get_style_context().add_class("linha")
+    textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+    textos.pack_start(rotulo(titulo), False, False, 0)
+    if sub:
+        textos.pack_start(rotulo(sub, "dim", quebra=True), False, False, 0)
+    box.pack_start(textos, True, True, 0)
+    if widget is not None:
+        widget.set_valign(Gtk.Align.CENTER)
+        box.pack_end(widget, False, False, 0)
+    return box
+
+
+def chave(ativo, ao_mudar):
+    """Cria um interruptor (Gtk.Switch) que chama ao_mudar(True/False) quando muda."""
+    s = Gtk.Switch(active=ativo)
+    s.connect("notify::active", lambda w, _p: ao_mudar(w.get_active()))
+    return s
+
+
+def deslizante(minimo, maximo, passo, valor, ao_mudar, largura=220, atraso=250):
+    """Cria um controle deslizante. Só aplica a mudança depois de 'atraso' ms sem mexer,
+    para não gravar arquivos a cada pixel arrastado.
+    """
+    s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, minimo, maximo, passo)
+    s.set_value(valor)
+    s.set_draw_value(False)
+    s.set_size_request(largura, -1)
+    pendente = {"id": 0}
+
+    def mudou(w):
+        """Reinicia a contagem do atraso a cada movimento do controle."""
+        if pendente["id"]:
+            GLib.source_remove(pendente["id"])
+
+        def agora():
+            """Aplica o valor depois que o usuário parou de mexer."""
+            pendente["id"] = 0
+            ao_mudar(w.get_value())
+            return False
+        pendente["id"] = GLib.timeout_add(atraso, agora)
+    s.connect("value-changed", mudou)
+    return s
+
+
+def botao(texto, ao_clicar):
+    """Cria um botão que chama ao_clicar() quando clicado."""
+    b = Gtk.Button(label=texto)
+    b.connect("clicked", lambda _b: ao_clicar())
+    return b
+
+
+TECLAS = {"W": "Super", "S": "Shift", "C": "Ctrl", "A": "Alt", "Return": "Enter", "Escape": "Esc",
+          "space": "Espaço", "Prior": "Page Up", "Next": "Page Down", "Up": "↑", "Down": "↓",
+          "Left": "←", "Right": "→", "Tab": "Tab", "Print": "Print Screen", "Delete": "Delete",
+          "XF86AudioRaiseVolume": "Volume +", "XF86AudioLowerVolume": "Volume −",
+          "XF86AudioMute": "Sem som", "XF86AudioMicMute": "Microfone mudo",
+          "XF86MonBrightnessUp": "Brilho +", "XF86MonBrightnessDown": "Brilho −",
+          "XF86Calculator": "Calculadora", "XF86AudioPlay": "Play/Pause",
+          "XF86AudioNext": "Próxima faixa", "XF86AudioPrev": "Faixa anterior"}
+# atalhos antigos do rc.xml que não têm descrição em comentário
+DESCRICOES = {"W-Return": "Terminal", "W-d": "Menu de aplicativos", "W-space": "Menu de aplicativos",
+              "W-q": "Fechar janela", "W-l": "Bloquear tela", "W-Escape": "Menu de energia",
+              "Print": "Capturar área", "S-Print": "Capturar tela inteira",
+              "C-Print": "Abrir o capturador de tela", "XF86AudioRaiseVolume": "Aumentar volume",
+              "XF86AudioLowerVolume": "Diminuir volume", "XF86AudioMute": "Sem som",
+              "XF86AudioMicMute": "Microfone mudo", "XF86MonBrightnessUp": "Aumentar brilho",
+              "XF86MonBrightnessDown": "Diminuir brilho", "XF86Calculator": "Calculadora",
+              "XF86AudioPlay": "Tocar / pausar", "XF86AudioNext": "Próxima faixa",
+              "XF86AudioPrev": "Faixa anterior"}
+# atalhos que o labwc já traz por padrão
+PADRAO_LABWC = [("A-Tab", "Alternar janelas"), ("A-F4", "Fechar janela")]
+
+
+def nome_tecla(chave_):
+    """Traduz o nome técnico de um atalho do labwc (ex.: 'C-S-W-Left') para algo legível
+    ('Ctrl + Shift + Super + ←').
+    """
+    partes = chave_.split("-")
+    return " + ".join(TECLAS.get(p, p.upper() if len(p) == 1 else p) for p in partes)
+
+
+def grupo_atalho(chave_, descricao):
+    """Decide em que grupo da seção 'Atalhos de teclado' o atalho aparece."""
+    d = descricao.lower()
+    if chave_.startswith("XF86"):
+        return "Teclas especiais"
+    if "print" in chave_.lower():
+        return "Captura de tela"
+    if "área" in d or "monitor" in d:
+        return "Áreas de trabalho e monitores"
+    if any(p in d for p in ("janela", "maximizar", "minimizar", "metade", "tela cheia", "quarto", "centralizar")):
+        return "Janelas"
+    return "Sistema e aplicativos"
+
+
+# ---------------------------------------------------------------- energia
+MAKO = os.path.join(HOME, ".config/mako/config")
+TRAVA = shutil.which("bloquear") or "swaylock -f"
+
+
+def linha_swayidle(e):
+    """Monta o comando do swayidle (bloquear, apagar a tela, suspender) a partir das escolhas."""
+    partes = ["swayidle -w"]
+    if e["bloquear"]:
+        partes.append(f"timeout {e['bloquear'] * 60} '{TRAVA}'")
+    if e["tela"] and tem("wlopm"):
+        partes.append(f"timeout {e['tela'] * 60} 'wlopm --off \\*' resume 'wlopm --on \\*'")
+    if e["suspender"]:
+        partes.append(f"timeout {e['suspender'] * 60} 'systemctl suspend'")
+    partes.append(f"before-sleep '{TRAVA}'")
+    return " ".join(partes)
+
+
+def aplicar_energia(estado):
+    """Grava a regra de inatividade no autostart e reinicia o swayidle
+    (a não ser que o Caffeine esteja ligado).
+    """
+    json.dump(estado, open(ESTADO, "w"), indent=2)
+    cmd = linha_swayidle(estado["energia"])
+    texto = open(AUTOSTART).read()
+    nova = f"{cmd} >/dev/null 2>&1 &"
+    if re.search(r"^swayidle .*$", texto, re.M):
+        texto = re.sub(r"^swayidle .*$", lambda _m: nova, texto, count=1, flags=re.M)
+    else:
+        texto = texto.rstrip("\n") + "\n" + nova + "\n"
+    open(AUTOSTART, "w").write(texto)
+    rodar("pkill", "-x", "swayidle")
+    # com o Caffeine ligado, o swayidle fica parado até ele ser desligado
+    if not os.path.exists(os.path.join(GLib.get_user_runtime_dir(), "caffeine-ligado")):
+        subprocess.Popen(["sh", "-c", cmd], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def bateria():
+    """Lê carga, estado e saúde da bateria em /sys/class/power_supply/BAT0."""
+    base = "/sys/class/power_supply/BAT0"
+
+    def ler(nome):
+        """Lê um arquivo de /sys da bateria (vazio se não existir)."""
+        try:
+            return open(os.path.join(base, nome)).read().strip()
+        except OSError:
+            return ""
+    if not os.path.isdir(base):
+        return None
+    status = {"Charging": "carregando", "Discharging": "na bateria", "Full": "carregada",
+              "Not charging": "na tomada, sem carregar"}.get(ler("status"), ler("status").lower())
+    saude = ""
+    for cheio, projeto in (("charge_full", "charge_full_design"), ("energy_full", "energy_full_design")):
+        if ler(cheio) and ler(projeto):
+            saude = f"{100 * int(ler(cheio)) / int(ler(projeto)):.0f}% da capacidade original"
+            break
+    return f"{ler('capacity')}% — {status}", saude
+
+
+def tampa():
+    """Descobre o que o sistema faz ao fechar a tampa (HandleLidSwitch do systemd-logind)."""
+    valor = "suspend"
+    for arq in ["/etc/systemd/logind.conf"] + sorted(
+            os.path.join("/etc/systemd/logind.conf.d", f) for f in
+            (os.listdir("/etc/systemd/logind.conf.d") if os.path.isdir("/etc/systemd/logind.conf.d") else [])):
+        try:
+            for l in open(arq):
+                if l.strip().startswith("HandleLidSwitch="):
+                    valor = l.strip().split("=", 1)[1]
+        except OSError:
+            pass
+    return valor
+
+
+# ---------------------------------------------------------------- notificações
+POSICOES = [("top-right", "Canto superior direito"), ("top-center", "Topo, no centro"),
+            ("bottom-right", "Canto inferior direito")]
+
+
+def aplicar_mako(estado):
+    """Gera o config do mako (notificações) no visual dos menus, recarrega o mako
+    e mantém o 'não perturbe' depois de reiniciar a sessão.
+    """
+    json.dump(estado, open(ESTADO, "w"), indent=2)
+    n = estado["notificacoes"]
+    os.makedirs(os.path.dirname(MAKO), exist_ok=True)
+    open(MAKO, "w").write(f"""# Gerado pelo app Configurações (mesmo visual dos menus)
+font=Inter 10
+background-color=#181822f5
+text-color=#e6e6e6
+border-color=#ffffff22
+border-size=1
+border-radius=12
+padding=12
+margin=10
+width=340
+max-icon-size=40
+default-timeout={int(n['duracao']) * 1000}
+max-history=50
+anchor={n['posicao']}
+layer=overlay
+
+[urgency=high]
+border-color=#f7768e
+default-timeout=0
+
+[mode=do-not-disturb]
+invisible=1
+""")
+    rodar("makoctl", "reload")
+    rodar("makoctl", "mode", "-s", "do-not-disturb" if n["nao_perturbe"] else "default")
+    # mantém o "não perturbe" depois de reiniciar a sessão
+    texto = open(AUTOSTART).read()
+    texto = re.sub(r"^\(sleep 2; makoctl mode .*\n", "", texto, flags=re.M)
+    if n["nao_perturbe"]:
+        texto = texto.rstrip("\n") + "\n(sleep 2; makoctl mode -s do-not-disturb) >/dev/null 2>&1 &\n"
+    open(AUTOSTART, "w").write(texto)
+
+
+def ler_atalhos():
+    """Lê os atalhos do rc.xml (e a descrição no comentário ao lado de cada um)."""
+    try:
+        texto = open(RC).read()
+    except OSError:
+        return []
+    vistos, lista = set(), []
+    for m in re.finditer(r'<keybind key="([^"]+)">.*?</keybind>(?:[ \t]*<!--[ \t]*(.*?)[ \t]*-->)?', texto):
+        chave_, desc = m.group(1), m.group(2)
+        if chave_ in vistos:
+            continue
+        vistos.add(chave_)
+        desc = desc or DESCRICOES.get(chave_, chave_)
+        lista.append((nome_tecla(chave_), desc, grupo_atalho(chave_, desc)))
+    for chave_, desc in PADRAO_LABWC:
+        if chave_ not in vistos:
+            lista.append((nome_tecla(chave_), desc, grupo_atalho(chave_, desc)))
+    return lista
+
+
+def opcoes(itens, atual, ao_mudar):
+    """Cria uma lista de opções (Gtk.ComboBoxText) com chave interna e texto visível."""
+    c = Gtk.ComboBoxText()
+    for chave_, texto in itens:
+        c.append(chave_, texto)
+    c.set_active_id(atual)
+    c.connect("changed", lambda w: ao_mudar(w.get_active_id()))
+    return c
+
+
+# ---------------------------------------------------------------- janela
+class Configuracoes(Gtk.Application):
+    """Aplicativo de configurações: lista de seções à esquerda e a seção escolhida à direita."""
+    def __init__(self):
+        """Prepara o app (instância única: abrir de novo só traz a janela para frente)."""
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win = None
+        self.estado = ler_estado()
+
+    def do_activate(self):
+        """Cria a janela na primeira vez; nas próximas só a mostra."""
+        if self.win:
+            self.win.present()
+            return
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+
+        win = self.win = Gtk.ApplicationWindow(application=self)
+        win.get_style_context().add_class("configuracoes")
+        win.set_default_size(860, 580)
+        barra = Gtk.HeaderBar(title="Configurações", show_close_button=True)
+        win.set_titlebar(barra)
+
+        raiz = Gtk.Box()
+        win.add(raiz)
+        self.lista = Gtk.ListBox()
+        self.lista.get_style_context().add_class("lateral")
+        self.lista.set_size_request(220, -1)
+        rol = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        rol.get_style_context().add_class("lateral")
+        rol.add(self.lista)
+        raiz.pack_start(rol, False, False, 0)
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=120)
+        raiz.pack_start(self.stack, True, True, 0)
+
+        paginas = [
+            ("rede", "Wi-Fi e rede", "network-wireless-symbolic", self.pagina_rede),
+            ("bluetooth", "Bluetooth", "bluetooth-active-symbolic", self.pagina_bluetooth),
+            ("som", "Som", "audio-volume-high-symbolic", self.pagina_som),
+            ("tela", "Tela e brilho", "video-display-symbolic", self.pagina_tela),
+            ("energia", "Energia e bateria", "battery-good-symbolic", self.pagina_energia),
+            ("notificacoes", "Notificações", "preferences-system-notifications-symbolic", self.pagina_notificacoes),
+            ("mouse", "Mouse e touchpad", "input-mouse-symbolic", self.pagina_mouse),
+            ("teclado", "Teclado", "input-keyboard-symbolic", self.pagina_teclado),
+            ("atalhos", "Atalhos de teclado", "preferences-desktop-keyboard-shortcuts-symbolic", self.pagina_atalhos),
+            ("aparencia", "Aparência", "applications-graphics-symbolic", self.pagina_aparencia),
+            ("impressoras", "Impressoras", "printer-symbolic", self.pagina_impressoras),
+            ("sistema", "Usuários, data e idioma", "system-users-symbolic", self.pagina_sistema),
+            ("sobre", "Sobre", "help-about-symbolic", self.pagina_sobre),
+        ]
+        for pid, titulo, icone, construir in paginas:
+            row = Gtk.ListBoxRow()
+            row.pid = pid
+            b = Gtk.Box(spacing=10)
+            img = Gtk.Image.new_from_icon_name(icone, Gtk.IconSize.MENU)
+            b.pack_start(img, False, False, 0)
+            b.pack_start(rotulo(titulo), True, True, 0)
+            row.add(b)
+            self.lista.add(row)
+            self.stack.add_named(self.envolver(titulo, construir()), pid)
+        self.lista.connect("row-selected", lambda _l, r: r and self.stack.set_visible_child_name(r.pid))
+
+        win.show_all()
+        inicial = os.environ.get("CONFIG_PAGINA", "rede")
+        for row in self.lista.get_children():
+            if row.pid == inicial:
+                self.lista.select_row(row)
+
+    def envolver(self, titulo, conteudo):
+        """Coloca o título e o conteúdo de uma seção dentro de uma área com rolagem."""
+        caixa = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(caixa, f"set_margin_{m}")(24)
+        caixa.pack_start(rotulo(titulo, "titulo-pagina"), False, False, 0)
+        caixa.pack_start(conteudo, False, False, 0)
+        rol = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        rol.add(caixa)
+        return rol
+
+    def coluna(self, *filhos):
+        """Empilha vários elementos na vertical com espaçamento."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for f in filhos:
+            box.pack_start(f, False, False, 0)
+        return box
+
+    def salvar_labwc(self):
+        """Grava as opções de mouse/touchpad/teclado no rc.xml e recarrega o labwc."""
+        aplicar_labwc(self.estado)
+
+    # ---------------------------------------------------------- páginas
+    def pagina_rede(self):
+        """Seção Wi-Fi e rede: conexão atual, liga/desliga e atalhos para as ferramentas de rede."""
+        r = rodar("nmcli", "-t", "-f", "TYPE,STATE,CONNECTION", "device")
+        atual = "sem conexão"
+        if r:
+            for l in r.stdout.splitlines():
+                p = l.split(":")
+                if len(p) >= 3 and p[1] == "connected" and p[0] in ("wifi", "ethernet"):
+                    atual = ("Wi-Fi: " if p[0] == "wifi" else "Cabo: ") + p[2]
+                    break
+        wifi_on = (rodar("nmcli", "radio", "wifi") or subprocess.CompletedProcess([], 0, "")).stdout.strip() == "enabled"
+        return self.coluna(
+            cartao(linha("Conexão atual", rotulo(atual, "dim")),
+                   linha("Wi-Fi", chave(wifi_on, lambda v: rodar("nmcli", "radio", "wifi", "on" if v else "off")))),
+            cartao(linha("Trocar de rede", botao("Abrir", lambda: abrir(os.path.join(HOME, ".local/bin/menu-wifi"))),
+                         "O mesmo menu do Wi-Fi da barra superior"),
+                   linha("Conexões avançadas", botao("Abrir", lambda: abrir("nm-connection-editor")),
+                         "IP fixo, DNS, VPN, editar ou esquecer redes salvas"),
+                   linha("Configurações de rede do GNOME", botao("Abrir", lambda: abrir("gnome-control-center", "network", gnome=True)))),
+        )
+
+    def pagina_bluetooth(self):
+        """Seção Bluetooth: abre o Blueman (ou o GNOME Settings se não houver)."""
+        if tem("blueman-manager"):
+            principal = linha("Dispositivos Bluetooth", botao("Abrir", lambda: abrir("blueman-manager")),
+                              "Parear fones, mouses e celulares (Blueman)")
+        else:
+            principal = linha("Dispositivos Bluetooth", botao("Abrir", lambda: abrir("gnome-control-center", "bluetooth", gnome=True)),
+                              "Pelo GNOME Settings. Para um ícone na barra: sudo apt install blueman")
+        return self.coluna(cartao(principal))
+
+    def pagina_som(self):
+        """Seção Som: volume, mudo e atalho para o pavucontrol."""
+        r = rodar("wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@")
+        vol, mudo = 0.5, False
+        if r and r.stdout:
+            m = re.search(r"([\d.]+)", r.stdout)
+            vol = float(m.group(1)) if m else 0.5
+            mudo = "MUTED" in r.stdout
+        return self.coluna(
+            cartao(linha("Volume", deslizante(0, 1.0, 0.01, vol,
+                         lambda v: rodar("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{v:.2f}"), atraso=60)),
+                   linha("Sem som", chave(mudo, lambda v: rodar("wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1" if v else "0")))),
+            cartao(linha("Saídas, entradas e volume por app", botao("Abrir", lambda: abrir("pavucontrol")),
+                         "Escolher fone ou caixa, microfone e volume de cada programa")),
+        )
+
+    def pagina_tela(self):
+        """Seção Tela e brilho: brilho, monitores conectados e organizador de monitores."""
+        filhos = []
+        r = rodar("brightnessctl", "-m")
+        if r and r.returncode == 0 and r.stdout:
+            pct = float(r.stdout.split(",")[3].rstrip("%"))
+            filhos.append(cartao(linha("Brilho", deslizante(5, 100, 1, pct,
+                                       lambda v: rodar("brightnessctl", "set", f"{int(v)}%"), atraso=40))))
+        saida = rodar("wlr-randr")
+        monitores = []
+        if saida and saida.stdout:
+            nome = None
+            for l in saida.stdout.splitlines():
+                if l and not l.startswith(" "):
+                    nome = l.split('"')[1] if '"' in l else l.split()[0]
+                    monitores.append([l.split()[0], nome, ""])
+                elif "current" in l and monitores:
+                    monitores[-1][2] = l.strip().split(",")[0].replace(" px", "")
+        linhas_mon = [linha(f"{saida_} — {nome}", rotulo(res, "dim")) for saida_, nome, res in monitores]
+        if tem("wdisplays"):
+            linhas_mon.append(linha("Organizar monitores", botao("Abrir", lambda: abrir("wdisplays")),
+                                    "Posição, resolução, escala e espelhamento"))
+        else:
+            linhas_mon.append(linha("Organizar monitores", None,
+                                    "Instale o wdisplays para arrastar e ajustar monitores: sudo apt install wdisplays"))
+        filhos.append(cartao(*linhas_mon))
+        return self.coluna(*filhos)
+
+    def pagina_energia(self):
+        """Seção Energia e bateria: carga, tempos de bloqueio/suspensão e tampa."""
+        e = self.estado["energia"]
+        tempos = [("0", "Nunca"), ("2", "2 minutos"), ("5", "5 minutos"), ("10", "10 minutos"),
+                  ("15", "15 minutos"), ("30", "30 minutos"), ("60", "1 hora")]
+
+        def muda(campo):
+            """Devolve a função que grava um campo do touchpad/mouse e aplica no labwc."""
+            def f(valor):
+                """Grava o novo valor e aplica."""
+                e[campo] = int(valor)
+                aplicar_energia(self.estado)
+            return f
+        filhos = []
+        b = bateria()
+        if b:
+            carga, saude = b
+            filhos.append(cartao(linha("Bateria", rotulo(carga, "dim"), saude or None),
+                                 linha("Histórico de carga e consumo", botao("Abrir", lambda: abrir("gnome-power-statistics")))))
+        tela = linha("Desligar a tela após", opcoes(tempos, str(e["tela"]), muda("tela"))) if tem("wlopm") else \
+            linha("Desligar a tela após", None, "Precisa do wlopm: sudo apt install wlopm")
+        filhos.append(cartao(
+            linha("Bloquear a tela após", opcoes(tempos, str(e["bloquear"]), muda("bloquear")),
+                  "Tempo sem usar o computador até pedir a senha"),
+            tela,
+            linha("Suspender após", opcoes(tempos, str(e["suspender"]), muda("suspender")),
+                  "A tela sempre é bloqueada antes de suspender"),
+        ))
+        acao = tampa()
+        acoes_pt = {"suspend": "suspende", "ignore": "não faz nada", "poweroff": "desliga",
+                    "hibernate": "hiberna", "lock": "bloqueia", "suspend-then-hibernate": "suspende e depois hiberna"}
+        sub = None
+        if acao == "ignore":
+            sub = ("No GNOME é o próprio GNOME que suspende; no labwc o notebook fica ligado. "
+                   "Para suspender ao fechar: sudo sed -i 's/^HandleLidSwitch=ignore/HandleLidSwitch=suspend/' "
+                   "/etc/systemd/logind.conf  (vale após reiniciar; com monitor externo ligado, não suspende)")
+        filhos.append(cartao(linha("Ao fechar a tampa", rotulo(acoes_pt.get(acao, acao), "dim"), sub)))
+        if tem("auto-cpufreq-gtk"):
+            filhos.append(cartao(linha("Modo de desempenho", botao("Abrir", lambda: abrir("auto-cpufreq-gtk")),
+                                       "Controlado pelo auto-cpufreq: economia na bateria, desempenho na tomada")))
+        return self.coluna(*filhos)
+
+    def pagina_notificacoes(self):
+        """Seção Notificações: não perturbe, tempo na tela, posição e testes."""
+        n = self.estado["notificacoes"]
+
+        def muda(campo, conv=lambda v: v):
+            """Devolve a função que grava um campo de energia e reaplica o swayidle."""
+            def f(valor):
+                """Grava o novo valor e aplica."""
+                n[campo] = conv(valor)
+                aplicar_mako(self.estado)
+            return f
+        self.rotulo_duracao = rotulo(f"{n['duracao']} s", "dim")
+
+        def muda_duracao(v):
+            """Atualiza o texto 'N s' e grava a nova duração das notificações."""
+            self.rotulo_duracao.set_text(f"{int(v)} s")
+            muda("duracao", int)(v)
+        caixa_dur = Gtk.Box(spacing=8)
+        caixa_dur.pack_start(deslizante(2, 20, 1, n["duracao"], muda_duracao, largura=180), False, False, 0)
+        caixa_dur.pack_start(self.rotulo_duracao, False, False, 0)
+
+        def testar():
+            """Envia uma notificação de exemplo."""
+            abrir("notify-send", "-a", "Configurações", "-i", "preferences-system-notifications",
+                  "Notificação de teste", "É assim que as notificações aparecem.")
+        return self.coluna(
+            cartao(linha("Não perturbe", chave(n["nao_perturbe"], muda("nao_perturbe")),
+                         "Esconde as notificações. Alertas urgentes também ficam guardados."),
+                   linha("Tempo na tela", caixa_dur),
+                   linha("Posição", opcoes(POSICOES, n["posicao"], muda("posicao")))),
+            cartao(linha("Mostrar a última notificação", botao("Mostrar", lambda: rodar("makoctl", "restore")),
+                         "Traz de volta a notificação fechada mais recente"),
+                   linha("Fechar todas", botao("Fechar", lambda: rodar("makoctl", "dismiss", "-a"))),
+                   linha("Testar", botao("Enviar teste", testar))),
+        )
+
+    def pagina_mouse(self):
+        """Seção Mouse e touchpad: tocar para clicar, rolagem natural, velocidade etc."""
+        t, m = self.estado["touchpad"], self.estado["mouse"]
+
+        def muda(grupo, campo):
+            """Devolve a função que grava um campo de notificação e reaplica o mako."""
+            def f(valor):
+                """Grava o novo valor e aplica."""
+                self.estado[grupo][campo] = valor
+                self.salvar_labwc()
+            return f
+        return self.coluna(
+            rotulo("Touchpad", "dim"),
+            cartao(
+                linha("Tocar para clicar", chave(t["tap"], muda("touchpad", "tap")), "Um toque = clique, dois dedos = botão direito"),
+                linha("Rolagem natural", chave(t["natural"], muda("touchpad", "natural")), "O conteúdo acompanha os dedos, como no celular"),
+                linha("Desativar ao digitar", chave(t["dwt"], muda("touchpad", "dwt")), "Evita mover o cursor sem querer com a palma da mão"),
+                linha("Velocidade", deslizante(-1, 1, 0.05, t["velocidade"], muda("touchpad", "velocidade"))),
+                linha("Clique físico", opcoes([("buttonAreas", "Áreas (direita = botão direito)"),
+                                                ("clickfinger", "Dedos (dois dedos = botão direito)")],
+                                               t["clique"], muda("touchpad", "clique"))),
+            ),
+            rotulo("Mouse", "dim"),
+            cartao(
+                linha("Rolagem natural", chave(m["natural"], muda("mouse", "natural"))),
+                linha("Velocidade", deslizante(-1, 1, 0.05, m["velocidade"], muda("mouse", "velocidade"))),
+                linha("Aceleração", opcoes([("adaptive", "Adaptativa"), ("flat", "Desligada (precisa)")],
+                                           m["aceleracao"], muda("mouse", "aceleracao"))),
+            ),
+            rotulo("As mudanças valem na hora.", "dim"),
+        )
+
+    def pagina_teclado(self):
+        """Seção Teclado: layout e repetição de teclas."""
+        k = self.estado["teclado"]
+        amb = ler_ambiente()
+        atual = amb.get("XKB_DEFAULT_LAYOUT", "br") + ":" + amb.get("XKB_DEFAULT_VARIANT", "")
+        self.aviso_layout = rotulo("", "dim")
+
+        def muda_layout(chave_):
+            """Grava o layout escolhido no environment do labwc (vale no próximo login)."""
+            layout, variante = chave_.split(":")
+            a = ler_ambiente()
+            a["XKB_DEFAULT_LAYOUT"] = layout
+            a["XKB_DEFAULT_VARIANT"] = variante
+            a["XKB_DEFAULT_OPTIONS"] = "grp:alt_shift_toggle" if "," in layout else ""
+            gravar_ambiente(a)
+            self.aviso_layout.set_text("Vale a partir do próximo login (sair e entrar de novo).")
+
+        def muda(campo):
+            """Devolve a função que grava atraso/velocidade de repetição do teclado."""
+            def f(valor):
+                """Grava o novo valor e aplica."""
+                k[campo] = int(valor)
+                self.salvar_labwc()
+            return f
+        return self.coluna(
+            cartao(linha("Layout", opcoes([(f"{l}:{v}", t) for l, v, t in LAYOUTS], atual, muda_layout))),
+            self.aviso_layout,
+            cartao(
+                linha("Atraso para repetir", deslizante(150, 1000, 10, k["atraso"], muda("atraso")),
+                      "Tempo segurando a tecla até ela começar a repetir"),
+                linha("Velocidade de repetição", deslizante(10, 60, 1, k["repeticao"], muda("repeticao")),
+                      "Caracteres por segundo enquanto a tecla está pressionada"),
+            ),
+            cartao(linha("Teste aqui", Gtk.Entry(placeholder_text="Digite para testar"))),
+        )
+
+    def pagina_atalhos(self):
+        """Seção Atalhos de teclado: lista os atalhos do labwc agrupados."""
+        grupos = {}
+        for tecla, descricao, grupo in ler_atalhos():
+            grupos.setdefault(grupo, []).append(linha(descricao, rotulo(tecla, "dim")))
+        filhos = []
+        for grupo in ("Sistema e aplicativos", "Janelas", "Áreas de trabalho e monitores",
+                      "Captura de tela", "Teclas especiais"):
+            if grupo in grupos:
+                filhos += [rotulo(grupo, "dim"), cartao(*grupos[grupo])]
+        filhos.append(cartao(linha("Editar atalhos", botao("Abrir rc.xml", lambda: abrir("mousepad", RC)),
+                                   "Depois de salvar, use \"Recarregar configuração\" no clique direito da área de trabalho")))
+        return self.coluna(*filhos)
+
+    def pagina_aparencia(self):
+        """Seção Aparência: modo escuro, cor de destaque do tema Zorin e papel de parede."""
+        iface = Gio.Settings.new("org.gnome.desktop.interface")
+        tema = iface.get_string("gtk-theme")
+        m = re.match(r"Zorin(\w+?)-(Light|Dark)$", tema)
+        cor, modo = (m.group(1), m.group(2)) if m else ("Blue", "Light")
+        estado = {"cor": cor, "modo": modo}
+
+        def aplicar():
+            """Aplica tema GTK, ícones e preferência claro/escuro no GSettings."""
+            iface.set_string("gtk-theme", f"Zorin{estado['cor']}-{estado['modo']}")
+            iface.set_string("icon-theme", f"Zorin{estado['cor']}-{estado['modo']}")
+            iface.set_string("color-scheme", "prefer-dark" if estado["modo"] == "Dark" else "default")
+
+        def muda_modo(escuro):
+            """Liga/desliga o modo escuro."""
+            estado["modo"] = "Dark" if escuro else "Light"
+            aplicar()
+
+        caixa_cores = Gtk.Box(spacing=6)
+        botoes_cor = []
+
+        def escolhe_cor(c, b):
+            """Troca a cor de destaque (tema Zorin<Cor>) e marca o botão escolhido."""
+            estado["cor"] = c
+            for outro in botoes_cor:
+                outro.get_style_context().remove_class("atual")
+            b.get_style_context().add_class("atual")
+            aplicar()
+        for c in CORES:
+            if not os.path.isdir(f"/usr/share/themes/Zorin{c}-Light"):
+                continue
+            b = Gtk.Button()
+            b.get_style_context().add_class("cor")
+            b.set_tooltip_text(CORES_PT[c])
+            prov = Gtk.CssProvider()
+            prov.load_from_data(f"button {{ background: {CORES_HEX[c]}; }}".encode())
+            b.get_style_context().add_provider(prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+            if c == cor:
+                b.get_style_context().add_class("atual")
+            b.connect("clicked", lambda bb, c=c: escolhe_cor(c, bb))
+            botoes_cor.append(b)
+            caixa_cores.pack_start(b, False, False, 0)
+
+        # papéis de parede
+        os.makedirs(WALLPAPERS, exist_ok=True)
+        grade = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=4,
+                            column_spacing=6, row_spacing=6)
+        grade.set_margin_top(10)
+        grade.set_margin_bottom(10)
+        grade.set_margin_start(10)
+        grade.set_margin_end(10)
+        miniaturas = []
+        atual_papel = papel_atual()
+
+        def escolhe_papel(caminho, b):
+            """Aplica o papel de parede clicado e marca a miniatura escolhida."""
+            trocar_papel(caminho)
+            for outro in miniaturas:
+                outro.get_style_context().remove_class("atual")
+            b.get_style_context().add_class("atual")
+
+        def adiciona_miniatura(caminho):
+            """Cria a miniatura clicável de uma imagem na grade de papéis de parede."""
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(caminho, 132, 80, True)
+            except GLib.Error:
+                return
+            b = Gtk.Button()
+            b.get_style_context().add_class("miniatura")
+            b.add(Gtk.Image.new_from_pixbuf(pb))
+            b.set_tooltip_text(os.path.basename(caminho))
+            if atual_papel and os.path.realpath(caminho) == os.path.realpath(atual_papel):
+                b.get_style_context().add_class("atual")
+            b.connect("clicked", lambda bb: escolhe_papel(caminho, bb))
+            miniaturas.append(b)
+            grade.add(b)
+            b.show_all()
+
+        for nome in sorted(os.listdir(WALLPAPERS)):
+            if nome.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                adiciona_miniatura(os.path.join(WALLPAPERS, nome))
+
+        def adicionar_imagem():
+            """Abre o seletor de arquivos, copia a imagem para ~/Imagens/wallpapers e a aplica."""
+            dlg = Gtk.FileChooserDialog(title="Escolher papel de parede", transient_for=self.win,
+                                        action=Gtk.FileChooserAction.OPEN)
+            dlg.add_buttons("Cancelar", Gtk.ResponseType.CANCEL, "Usar", Gtk.ResponseType.ACCEPT)
+            filtro = Gtk.FileFilter()
+            filtro.set_name("Imagens")
+            filtro.add_mime_type("image/png")
+            filtro.add_mime_type("image/jpeg")
+            filtro.add_mime_type("image/webp")
+            dlg.add_filter(filtro)
+            dlg.set_current_folder(os.path.join(HOME, "Imagens"))
+            if dlg.run() == Gtk.ResponseType.ACCEPT:
+                origem = dlg.get_filename()
+                destino = os.path.join(WALLPAPERS, os.path.basename(origem))
+                if os.path.realpath(origem) != os.path.realpath(destino):
+                    shutil.copy2(origem, destino)
+                adiciona_miniatura(destino)
+                escolhe_papel(destino, miniaturas[-1])
+            dlg.destroy()
+
+        return self.coluna(
+            cartao(linha("Modo escuro", chave(modo == "Dark", muda_modo), "Para os apps GTK: Thunar, Mousepad, Atril..."),
+                   linha("Cor de destaque", caixa_cores)),
+            rotulo("Papel de parede", "dim"),
+            cartao(grade, linha("Outra imagem", botao("Escolher…", adicionar_imagem),
+                                "A imagem é copiada para ~/Imagens/wallpapers")),
+            cartao(linha("Fontes e ajustes avançados", botao("Abrir", lambda: abrir("gnome-tweaks")),
+                         "GNOME Tweaks: fontes, tamanho do texto, ícones e cursor")),
+        )
+
+    def pagina_impressoras(self):
+        """Seção Impressoras: impressora padrão e atalhos para gerenciar e ver a fila."""
+        if tem("system-config-printer"):
+            b = linha("Impressoras", botao("Abrir", lambda: abrir("system-config-printer")),
+                      "Adicionar, remover e definir a impressora padrão")
+        else:
+            b = linha("Impressoras", botao("Abrir", lambda: abrir("gnome-control-center", "printers", gnome=True)),
+                      "Pelo GNOME Settings")
+        r = rodar("lpstat", "-d")
+        padrao = r.stdout.split(":", 1)[-1].strip() if r and r.stdout and ":" in r.stdout else "nenhuma"
+        def fila():
+            """Abre a fila de impressão da impressora padrão."""
+            if tem("system-config-printer"):
+                abrir("system-config-printer", "--show-jobs", padrao)
+            else:
+                abrir("gnome-control-center", "printers", gnome=True)
+        return self.coluna(cartao(linha("Impressora padrão", rotulo(padrao, "dim")), b),
+                           cartao(linha("Fila de impressão", botao("Abrir", fila))))
+
+    def pagina_sistema(self):
+        """Seção Usuários, data e idioma: abre os painéis do GNOME Settings que funcionam no labwc."""
+        def g(painel):
+            """Devolve uma função que abre um painel específico do GNOME Settings."""
+            return lambda: abrir("gnome-control-center", painel, gnome=True)
+        return self.coluna(
+            cartao(
+                linha("Usuários, data e hora, idioma", botao("Abrir", g("system")),
+                      "Contas e senhas, fuso horário, formato de datas e idioma do sistema"),
+                linha("Aplicativos padrão e permissões", botao("Abrir", g("applications"))),
+                linha("Contas online", botao("Abrir", g("online-accounts")), "Google, Microsoft, Nextcloud"),
+                linha("Privacidade", botao("Abrir", g("privacy"))),
+                linha("Acessibilidade", botao("Abrir", g("universal-access"))),
+            ),
+            rotulo("Estas seções abrem o GNOME Settings, que funciona para elas também no labwc.", "dim", quebra=True),
+        )
+
+    def pagina_sobre(self):
+        """Seção Sobre: modelo, processador, memória, disco, sistema e versão do labwc."""
+        def ler(caminho, padrao=""):
+            """Lê um arquivo de texto inteiro (ou devolve o padrão se não existir)."""
+            try:
+                return open(caminho).read().strip()
+            except OSError:
+                return padrao
+        os_nome = "Linux"
+        for l in ler("/etc/os-release").splitlines():
+            if l.startswith("PRETTY_NAME="):
+                os_nome = l.split("=", 1)[1].strip('"')
+        cpu = next((l.split(":", 1)[1].strip() for l in ler("/proc/cpuinfo").splitlines()
+                    if l.startswith("model name")), "?")
+        cpu = re.sub(r"\s+", " ", cpu.replace("(R)", "").replace("(TM)", "").replace("CPU ", ""))
+        mem_kb = int(re.search(r"MemTotal:\s+(\d+)", ler("/proc/meminfo", "MemTotal: 0")).group(1))
+        disco = shutil.disk_usage("/")
+        labwc_v = (rodar("labwc", "--version") or subprocess.CompletedProcess([], 0, "")).stdout.split("\n")[0]
+        modelo = f"{ler('/sys/class/dmi/id/sys_vendor')} {ler('/sys/class/dmi/id/product_name')}".strip()
+        itens = [
+            ("Computador", modelo or platform.node()),
+            ("Nome na rede", platform.node()),
+            ("Processador", cpu),
+            ("Memória", f"{mem_kb / 1024 / 1024:.1f} GB"),
+            ("Disco", f"{disco.used / 1e9:.0f} GB usados de {disco.total / 1e9:.0f} GB"),
+            ("Sistema", os_nome),
+            ("Kernel", platform.release()),
+            ("Sessão", (labwc_v or "labwc") + " (Wayland)"),
+        ]
+        return self.coluna(cartao(*[linha(k, rotulo(v, "dim")) for k, v in itens]))
+
+
+if __name__ == "__main__":
+    Configuracoes().run(None)

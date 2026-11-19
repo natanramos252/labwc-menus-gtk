@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<!--
+  Trecho para o ~/.config/labwc/rc.xml (labwc 0.7).
+  As regras de janela tiram a barra de título dos menus, os escondem da dock/Alt+Tab
+  e os posicionam logo abaixo do botão correspondente na barra superior.
+
+  ATENÇÃO: as posições (MoveTo x/y) foram calculadas para uma tela de 1366x768 com
+  a barra do exemplo do Waybar. Ajuste o "x" para a sua resolução/barra.
+-->
+<labwc_config>
+  <keyboard>
+    <default />
+    <keybind key="W-a"><action name="Execute" command="menu-iniciar" /></keybind>        <!-- Menu de aplicativos -->
+    <keybind key="W-i"><action name="Execute" command="configuracoes" /></keybind>       <!-- Configurações -->
+    <keybind key="W-v"><action name="Execute" command="menu-calendario" /></keybind>     <!-- Calendário e notificações -->
+    <keybind key="W-n"><action name="Execute" command="menu-wifi" /></keybind>           <!-- Redes Wi-Fi -->
+    <keybind key="W-Escape"><action name="Execute" command="menu-energia" /></keybind>   <!-- Menu de energia -->
+    <keybind key="W-l"><action name="Execute" command="bloquear" /></keybind>            <!-- Bloquear a tela -->
+  </keyboard>
+
+  <windowRules>
+    <windowRule title="Menu Iniciar" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">
+      <action name="MoveTo" x="6" y="30" />
+    </windowRule>
+    <windowRule title="Calendário" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">
+      <action name="MoveTo" x="338" y="30" />   <!-- centralizado sob o relógio (painel com ~690 px) -->
+    </windowRule>
+    <windowRule title="Volume" identifier="org.labwc.MenuVolume" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">
+      <action name="MoveTo" x="859" y="30" />
+    </windowRule>
+    <windowRule title="Rede Wi-Fi" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">
+      <action name="MoveTo" x="930" y="30" />
+    </windowRule>
+    <windowRule title="Dispositivos" identifier="org.labwc.MenuDispositivos" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">
+      <action name="MoveTo" x="780" y="30" />
+    </windowRule>
+    <windowRule title="Energia" identifier="org.labwc.MenuEnergia" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">
+      <action name="MoveTo" x="1122" y="30" />
+    </windowRule>
+  </windowRules>
+</labwc_config>

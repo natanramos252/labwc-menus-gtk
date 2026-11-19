@@ -1,0 +1,803 @@
+#!/usr/bin/env python3
+"""Menu iniciar para o labwc no layout "Standard" do Zorin Menu.
+
+Esquerda: categorias do sistema (gnome-applications.menu, as mesmas do Zorin),
+apps da categoria com "Voltar", "Todos os aplicativos" e busca.
+Direita: usuário, pastas, atalhos e botões de sessão.
+
+Rodar de novo enquanto está aberto fecha o menu. Esc também fecha.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+
+# O menu do GNOME esconde apps marcados OnlyShowIn=GNOME (ex.: Configurações)
+# quando a sessão não é GNOME. Para mostrar as mesmas coisas que o Zorin Menu,
+# o menu é carregado como se fosse GNOME. Os apps abertos recebem o valor original.
+ORIG_DESKTOP = os.environ.get("XDG_CURRENT_DESKTOP", "")
+if "GNOME" not in ORIG_DESKTOP.split(":"):
+    os.environ["XDG_CURRENT_DESKTOP"] = ":".join(p for p in (ORIG_DESKTOP, "GNOME") if p)
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("GMenu", "3.0")
+from gi.repository import Gdk, Gio, GLib, GMenu, Gtk  # noqa: E402
+
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell  # noqa: E402
+except (ValueError, ImportError):
+    GtkLayerShell = None
+
+# Comando de bloqueio de tela: usa o script "bloquear" deste repositório se estiver
+# instalado no PATH; senão, cai no swaylock puro.
+BLOQUEAR = shutil.which("bloquear") or "swaylock"
+APP_ID = "org.labwc.MenuIniciar"
+GLib.set_prgname(APP_ID)  # vira o app_id da janela no Wayland (usado na regra do rc.xml)
+CLOSED_STAMP = os.path.join(GLib.get_user_runtime_dir(), "menu-iniciar.closed")
+TESTE = os.environ.get("MENU_TESTE")  # usado só para capturas de teste
+
+CATEGORIAS_PT = {
+    "Accessories": "Acessórios",
+    "Education": "Educação",
+    "Games": "Jogos",
+    "Graphics": "Gráficos",
+    "Internet": "Internet",
+    "Office": "Escritório",
+    "Other": "Outros",
+    "Programming": "Programação",
+    "Science": "Ciência",
+    "Sound & Video": "Som e vídeo",
+    "System Tools": "Ferramentas do sistema",
+    "Utilities": "Utilitários",
+    "Wine": "Wine",
+}
+SETTINGS_IDS = {"org.gnome.Settings.desktop", "gnome-control-center.desktop"}
+
+CSS = b"""
+window.menu-iniciar { background-color: transparent; }
+#menu {
+  background-color: rgba(24, 24, 34, 0.985);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 10px;
+}
+#menu, #menu label, #menu image { color: #e6e6e6; }
+#menu .dim { color: #9a9aa8; }
+#menu list, #menu scrolledwindow, #menu viewport, #menu stack { background: transparent; }
+#menu row { padding: 4px 8px; border-radius: 8px; }
+#menu row:hover { background-color: rgba(255, 255, 255, 0.08); }
+#menu row:selected, #menu row:focus { background-color: rgba(255, 255, 255, 0.15); outline: none; }
+#menu button {
+  background: transparent; border: none; box-shadow: none;
+  border-radius: 8px; padding: 5px 8px; color: #e6e6e6;
+}
+#menu button:hover { background-color: rgba(255, 255, 255, 0.10); }
+#menu button.confirmar { background-color: #c0392b; }
+#menu .sidebar button label { font-size: 13px; }
+#menu .usuario { font-weight: bold; font-size: 14px; }
+#menu .separador { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; min-width: 1px; margin: 6px 4px; }
+#menu entry {
+  background-color: rgba(255, 255, 255, 0.08); color: #eeeeee;
+  border: none; box-shadow: none; border-radius: 18px; padding: 6px 12px;
+}
+#menu entry:focus { background-color: rgba(255, 255, 255, 0.14); }
+#menu .vazio { padding: 24px; }
+"""
+
+
+def normalizar(texto):
+    """Deixa o texto em minúsculas e sem acentos, para a busca achar 'calculo' em 'Cálculo'."""
+    texto = (texto or "").casefold()
+    return "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
+
+
+# ---------------------------------------------------------------- busca extra
+CONFIG_PAGINAS = [  # (id da seção no app Configurações, nome, ícone, palavras-chave)
+    ("rede", "Wi-Fi e rede", "network-wireless-symbolic", "wifi wi-fi internet rede vpn ip dns cabo"),
+    ("bluetooth", "Bluetooth", "bluetooth-active-symbolic", "bluetooth fone parear"),
+    ("som", "Som", "audio-volume-high-symbolic", "som volume audio áudio microfone alto-falante fone"),
+    ("tela", "Tela e brilho", "video-display-symbolic", "tela brilho monitor resolução escala"),
+    ("energia", "Energia e bateria", "battery-good-symbolic", "energia bateria suspender bloquear tampa inatividade"),
+    ("notificacoes", "Notificações", "preferences-system-notifications-symbolic", "notificações notificacoes não perturbe"),
+    ("mouse", "Mouse e touchpad", "input-mouse-symbolic", "mouse touchpad toque rolagem ponteiro"),
+    ("teclado", "Teclado", "input-keyboard-symbolic", "teclado layout abnt2 repetição"),
+    ("atalhos", "Atalhos de teclado", "preferences-desktop-keyboard-shortcuts-symbolic", "atalhos teclas super"),
+    ("aparencia", "Aparência", "applications-graphics-symbolic", "aparência tema escuro claro papel parede wallpaper cor fundo"),
+    ("impressoras", "Impressoras", "printer-symbolic", "impressora imprimir"),
+    ("sistema", "Usuários, data e idioma", "system-users-symbolic", "usuário usuários senha data hora idioma fuso"),
+    ("sobre", "Sobre", "help-about-symbolic", "sobre sistema memória processador versão"),
+]
+IGNORAR_PASTAS = {"node_modules", "__pycache__", "venv", ".venv", "site-packages", "snap", "go", ".git",
+                  "dist", "build", "target", ".cargo", ".rustup", ".npm", ".gradle", ".m2"}
+MAX_ARQUIVOS = 80000
+
+
+def calcular(texto):
+    """Conta simples digitada na busca. Devolve o resultado em texto ou None."""
+    import ast
+    import operator
+    t = texto.strip().replace(" ", "")
+    if not t or not re.fullmatch(r"[0-9.,+\-*/x×÷^%()]+", t) or not re.search(r"\d[+\-*/x×÷^%]", t):
+        return None
+    expr = t.replace(",", ".").replace("×", "*").replace("x", "*").replace("÷", "/").replace("^", "**")
+    expr = re.sub(r"(\d+(?:\.\d+)?)%", r"(\1/100)", expr)
+    ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+           ast.Div: operator.truediv, ast.Pow: operator.pow, ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+    def avaliar(no):
+        """Avalia a conta nó por nó, aceitando só números e operações básicas (sem eval)."""
+        if isinstance(no, ast.Constant) and isinstance(no.value, (int, float)):
+            return no.value
+        if isinstance(no, ast.BinOp) and type(no.op) in ops:
+            esq, dir_ = avaliar(no.left), avaliar(no.right)
+            if isinstance(no.op, ast.Pow) and abs(dir_) > 100:
+                raise ValueError
+            return ops[type(no.op)](esq, dir_)
+        if isinstance(no, ast.UnaryOp) and type(no.op) in ops:
+            return ops[type(no.op)](avaliar(no.operand))
+        raise ValueError
+    try:
+        valor = avaliar(ast.parse(expr, mode="eval").body)
+    except (ValueError, SyntaxError, ZeroDivisionError, OverflowError, TypeError):
+        return None
+    if isinstance(valor, float) and valor.is_integer() and abs(valor) < 1e15:
+        valor = int(valor)
+    texto_res = f"{valor:,}".replace(",", " ") if isinstance(valor, int) else f"{valor:.10g}"
+    return texto_res.replace(".", ",")
+
+
+def arquivos_recentes():
+    """Lê os arquivos recentes registrados pelos apps (recently-used.xbel)."""
+    from urllib.parse import unquote, urlparse
+    caminho = os.path.expanduser("~/.local/share/recently-used.xbel")
+    try:
+        texto = open(caminho, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return []
+    vistos, lista = set(), []
+    for href in reversed(re.findall(r'href="(file://[^"]+)"', texto)):
+        p = unquote(urlparse(href).path)
+        if p not in vistos and os.path.exists(p):
+            vistos.add(p)
+            lista.append(p)
+    return lista[:300]
+
+
+def indexar_arquivos():
+    """Lista arquivos e pastas da pasta pessoal (sem ocultos nem pastas de programação)."""
+    home = os.path.expanduser("~")
+    resultado, pilha = [], [(home, 0)]
+    while pilha and len(resultado) < MAX_ARQUIVOS:
+        pasta, nivel = pilha.pop()
+        try:
+            with os.scandir(pasta) as it:
+                for e in it:
+                    if e.name.startswith(".") or e.name in IGNORAR_PASTAS:
+                        continue
+                    resultado.append(e.path)
+                    if nivel < 6 and e.is_dir(follow_symlinks=False):
+                        pilha.append((e.path, nivel + 1))
+        except OSError:
+            continue
+    return resultado
+
+
+def separador(vertical=False):
+    """Linha fina (horizontal ou vertical) entre partes do menu."""
+    sep = Gtk.Box()
+    sep.get_style_context().add_class("separador")
+    if vertical:
+        sep.set_size_request(1, -1)
+    else:
+        sep.set_size_request(-1, 1)
+    return sep
+
+
+def carregar_categorias():
+    """Lê o menu do sistema na mesma ordem e com as mesmas categorias do Zorin Menu."""
+    arvore = GMenu.Tree.new("gnome-applications.menu", GMenu.TreeFlags.SORT_DISPLAY_NAME)
+    arvore.load_sync()
+
+    def apps_de(diretorio):
+        """Reúne os apps de uma categoria, incluindo subcategorias."""
+        apps, it = [], diretorio.iter()
+        while True:
+            tipo = it.next()
+            if tipo == GMenu.TreeItemType.INVALID:
+                return apps
+            if tipo == GMenu.TreeItemType.ENTRY:
+                apps.append(it.get_entry().get_app_info())
+            elif tipo == GMenu.TreeItemType.DIRECTORY:
+                apps.extend(apps_de(it.get_directory()))
+
+    categorias, it = [], arvore.get_root_directory().iter()
+    while True:
+        tipo = it.next()
+        if tipo == GMenu.TreeItemType.INVALID:
+            break
+        if tipo == GMenu.TreeItemType.DIRECTORY:
+            d = it.get_directory()
+            apps = apps_de(d)
+            if apps:
+                nome = CATEGORIAS_PT.get(d.get_name(), d.get_name())
+                categorias.append((nome, d.get_icon(), apps))
+
+    todos = {}
+    for _, _, apps in categorias:
+        for ai in apps:
+            todos.setdefault(ai.get_id(), ai)
+    todos = sorted(todos.values(), key=lambda a: normalizar(a.get_display_name()))
+
+    favoritos = []
+    try:
+        # favoritos do GNOME; os escondidos no labwc viram o substituto leve
+        trocas = {"org.gnome.Nautilus.desktop": "thunar.desktop",
+                  "org.gnome.Terminal.desktop": "org.codeberg.dnkl.foot.desktop",
+                  "org.gnome.TextEditor.desktop": "org.xfce.mousepad.desktop",
+                  "org.gnome.Settings.desktop": "org.labwc.Configuracoes.desktop"}
+        for app_id in Gio.Settings.new("org.gnome.shell").get_strv("favorite-apps"):
+            for tentativa in (app_id, trocas.get(app_id)):
+                try:
+                    ai = Gio.DesktopAppInfo.new(tentativa) if tentativa else None
+                except TypeError:
+                    ai = None
+                if ai and ai.should_show() and ai.get_id() not in [f.get_id() for f in favoritos]:
+                    favoritos.append(ai)
+                    break
+    except Exception:
+        pass
+    if favoritos:
+        categorias.insert(0, ("Favoritos", Gio.ThemedIcon.new("starred"), favoritos))
+    return categorias, todos
+
+
+class MenuIniciar(Gtk.Application):
+    """O menu de aplicativos (layout 'Standard' do Zorin Menu)."""
+    def __init__(self):
+        """Prepara o app de instância única."""
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win = None
+        self._confirmar = None
+
+    # ---------- ciclo de vida ----------
+    def do_activate(self):
+        """Abre o menu; se já estiver aberto (clique de novo no botão), fecha."""
+        if self.win is not None:  # segunda chamada com o menu aberto: fecha
+            self.fechar()
+            return
+        try:  # o clique que tirou o foco já fechou o menu: não reabrir
+            if time.time() - os.path.getmtime(CLOSED_STAMP) < 0.4:
+                self.quit()
+                return
+        except OSError:
+            pass
+        self.categorias, self.todos = carregar_categorias()
+        self.construir()
+
+    def fechar(self, marcar=False):
+        """Fecha o menu. Com marcar=True, anota a hora para o clique que tirou o foco não reabri-lo."""
+        if marcar:
+            try:
+                with open(CLOSED_STAMP, "w"):
+                    pass
+            except OSError:
+                pass
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+        self.quit()
+
+    # ---------- interface ----------
+    def construir(self):
+        """Monta a janela: categorias/apps e busca à esquerda, barra lateral à direita.
+        A largura da coluna esquerda é travada no nome de app mais longo (sem cortar texto).
+        """
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+
+        win = self.win = Gtk.ApplicationWindow(application=self, title="Menu Iniciar")
+        win.get_style_context().add_class("menu-iniciar")
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_default_size(-1, 500)
+        win.set_app_paintable(True)
+        visual = win.get_screen().get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+
+        if GtkLayerShell is not None and GtkLayerShell.is_supported():
+            GtkLayerShell.init_for_window(win)
+            GtkLayerShell.set_namespace(win, "menu-iniciar")
+            GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, True)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, 30)
+            GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, 6)
+            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.ON_DEMAND)
+
+        raiz = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        raiz.set_name("menu")
+        raiz.set_size_request(-1, 500)
+        win.add(raiz)
+
+        # --- coluna esquerda ---
+        esquerda = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        raiz.pack_start(esquerda, True, True, 0)
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT,
+                               transition_duration=150)
+        esquerda.pack_start(self.stack, True, True, 0)
+
+        self.lista_cats = Gtk.ListBox()
+        self.lista_cats.connect("row-activated", self.ao_escolher_categoria)
+        for nome, icone, apps in self.categorias:
+            self.lista_cats.add(self.linha(nome, icone, 24, seta=True, dados=(nome, apps)))
+        self.stack.add_named(self.rolagem(self.lista_cats), "cats")
+
+        pagina_apps = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.titulo_apps = Gtk.Label(xalign=0)
+        self.titulo_apps.get_style_context().add_class("dim")
+        self.titulo_apps.set_margin_start(10)
+        pagina_apps.pack_start(self.titulo_apps, False, False, 2)
+        self.lista_apps = Gtk.ListBox()
+        self.lista_apps.connect("row-activated", self.ao_abrir_app)
+        pagina_apps.pack_start(self.rolagem(self.lista_apps), True, True, 0)
+        for ai in self.todos:
+            self.lista_apps.add(self.linha(ai.get_display_name(), ai.get_icon(), 26, dados=ai))
+        self.stack.add_named(pagina_apps, "apps")
+
+        self.botao_rodape = Gtk.Button()
+        self.botao_rodape.connect("clicked", self.ao_rodape)
+        esquerda.pack_start(self.botao_rodape, False, False, 0)
+
+        self.busca = Gtk.SearchEntry(placeholder_text="Digite para pesquisar…")
+        self.busca.connect("search-changed", self.ao_buscar)
+        self.busca.connect("activate", self.ao_enter_busca)
+        esquerda.pack_start(self.busca, False, False, 0)
+
+        raiz.pack_start(separador(vertical=True), False, False, 0)
+
+        # --- barra lateral ---
+        raiz.pack_start(self.barra_lateral(), False, False, 0)
+
+        win.connect("key-press-event", self.ao_tecla)
+        win.connect("focus-out-event", lambda *a: (not TESTE) and self.fechar(marcar=True))
+        self.mostrar_categorias()
+        win.show_all()
+        esquerda.set_size_request(esquerda.get_preferred_width()[1], -1)
+        self.iniciar_indice()
+        self.busca.grab_focus()
+
+        if TESTE:
+            self.aplicar_teste(TESTE)
+
+    def rolagem(self, filho):
+        """Coloca uma lista dentro de uma área com rolagem vertical."""
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sw.set_propagate_natural_width(True)
+        sw.add(filho)
+        return sw
+
+    def linha(self, texto, gicon, tamanho, seta=False, dados=None, subtitulo=None):
+        """Uma linha da lista: ícone, nome (e subtítulo opcional) e seta opcional."""
+        row = Gtk.ListBoxRow()
+        row.dados = dados
+        caixa = Gtk.Box(spacing=10)
+        img = Gtk.Image.new_from_gicon(gicon or Gio.ThemedIcon.new("application-x-executable"),
+                                       Gtk.IconSize.DIALOG)
+        img.set_pixel_size(tamanho)
+        caixa.pack_start(img, False, False, 0)
+        textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        rot = Gtk.Label(label=texto, xalign=0)
+        textos.pack_start(rot, False, False, 0)
+        if subtitulo:
+            sub = Gtk.Label(label=subtitulo, xalign=0)
+            sub.set_ellipsize(3)
+            sub.get_style_context().add_class("dim")
+            textos.pack_start(sub, False, False, 0)
+        caixa.pack_start(textos, True, True, 0)
+        if seta:
+            caixa.pack_end(Gtk.Image.new_from_icon_name("go-next-symbolic", Gtk.IconSize.MENU),
+                           False, False, 0)
+        row.add(caixa)
+        return row
+
+    def barra_lateral(self):
+        """Barra da direita: usuário, pastas, atalhos e botões de sessão."""
+        lateral = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        lateral.get_style_context().add_class("sidebar")
+
+        # usuário
+        topo = Gtk.Box(spacing=10)
+        topo.set_margin_start(8)
+        topo.set_margin_top(4)
+        topo.set_margin_bottom(4)
+        avatar = None
+        for caminho in (os.path.expanduser("~/.face"),
+                        f"/var/lib/AccountsService/icons/{GLib.get_user_name()}"):
+            if os.access(caminho, os.R_OK):
+                try:
+                    from gi.repository import GdkPixbuf
+                    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(caminho, 36, 36, True)
+                    avatar = Gtk.Image.new_from_pixbuf(pb)
+                    break
+                except Exception:
+                    pass
+        if avatar is None:
+            avatar = Gtk.Image.new_from_icon_name("avatar-default", Gtk.IconSize.DIALOG)
+            avatar.set_pixel_size(36)
+        topo.pack_start(avatar, False, False, 0)
+        nome = GLib.get_real_name()
+        if not nome or nome == "Unknown":
+            nome = GLib.get_user_name()
+        rot = Gtk.Label(label=nome, xalign=0)
+        rot.get_style_context().add_class("usuario")
+        topo.pack_start(rot, True, True, 0)
+        lateral.pack_start(topo, False, False, 0)
+        lateral.pack_start(separador(), False, False, 0)
+
+        # pastas
+        pastas = [("Pasta pessoal", "user-home", GLib.get_home_dir())]
+        for diretorio, rotulo, icone in (
+            (GLib.UserDirectory.DIRECTORY_DESKTOP, "Área de trabalho", "user-desktop"),
+            (GLib.UserDirectory.DIRECTORY_DOCUMENTS, "Documentos", "folder-documents"),
+            (GLib.UserDirectory.DIRECTORY_DOWNLOAD, "Downloads", "folder-download"),
+            (GLib.UserDirectory.DIRECTORY_MUSIC, "Músicas", "folder-music"),
+            (GLib.UserDirectory.DIRECTORY_PICTURES, "Imagens", "folder-pictures"),
+            (GLib.UserDirectory.DIRECTORY_VIDEOS, "Vídeos", "folder-videos"),
+        ):
+            caminho = GLib.get_user_special_dir(diretorio)
+            if caminho and os.path.isdir(caminho) and caminho != GLib.get_home_dir():
+                pastas.append((rotulo, icone, caminho))
+        for rotulo, icone, caminho in pastas:
+            lateral.pack_start(self.botao_lateral(rotulo, icone, self.abrir_pasta, caminho),
+                               False, False, 0)
+        lateral.pack_start(separador(), False, False, 0)
+
+        # atalhos
+        for app_id, rotulo, icone in (
+            ("org.labwc.Configuracoes.desktop", "Configurações", "preferences-system"),
+            ("xfce4-taskmanager.desktop", "Monitor do sistema", "utilities-system-monitor"),
+            ("foot.desktop", "Terminal", "utilities-terminal"),
+        ):
+            try:
+                ai = Gio.DesktopAppInfo.new(app_id)
+            except TypeError:
+                ai = None
+            if ai:
+                lateral.pack_start(self.botao_lateral(rotulo, icone, lambda _b, a=ai: self.abrir(a)),
+                                   False, False, 0)
+
+        lateral.pack_start(Gtk.Box(), True, True, 0)  # empurra a sessão para baixo
+        lateral.pack_start(separador(), False, False, 0)
+
+        # sessão
+        self.aviso = Gtk.Label(label="", xalign=0.5)
+        self.aviso.get_style_context().add_class("dim")
+        lateral.pack_start(self.aviso, False, False, 0)
+        sessao = Gtk.Box(spacing=2, halign=Gtk.Align.CENTER)
+        for icone, dica, cmd, confirmar in (
+            ("system-lock-screen-symbolic", "Bloquear", [BLOQUEAR], False),
+            ("system-log-out-symbolic", "Sair da sessão", ["labwc", "--exit"], True),
+            ("media-playback-pause-symbolic", "Suspender", ["systemctl", "suspend"], False),
+            ("system-reboot-symbolic", "Reiniciar", ["systemctl", "reboot"], True),
+            ("system-shutdown-symbolic", "Desligar", ["systemctl", "poweroff"], True),
+        ):
+            b = Gtk.Button.new_from_icon_name(icone, Gtk.IconSize.BUTTON)
+            b.set_tooltip_text(dica)
+            b.connect("clicked", self.ao_sessao, dica, cmd, confirmar)
+            sessao.pack_start(b, False, False, 0)
+        lateral.pack_start(sessao, False, False, 4)
+        return lateral
+
+    def botao_lateral(self, rotulo, icone, callback, *args):
+        """Botão da barra lateral com ícone e texto."""
+        b = Gtk.Button()
+        caixa = Gtk.Box(spacing=10)
+        img = Gtk.Image.new_from_icon_name(icone, Gtk.IconSize.MENU)
+        img.set_pixel_size(18)
+        caixa.pack_start(img, False, False, 0)
+        caixa.pack_start(Gtk.Label(label=rotulo, xalign=0), True, True, 0)
+        b.add(caixa)
+        b.connect("clicked", callback, *args)
+        return b
+
+    # ---------- navegação ----------
+    def mostrar_categorias(self):
+        """Volta para a lista de categorias."""
+        self.stack.set_visible_child_name("cats")
+        self.botao_rodape.set_label("Todos os aplicativos  ›")
+        self.modo = "cats"
+
+    def mostrar_apps(self, titulo, apps, modo):
+        """Mostra uma lista de apps (de uma categoria ou todos)."""
+        for filho in self.lista_apps.get_children():
+            self.lista_apps.remove(filho)
+        if not apps:
+            vazio = Gtk.Label(label="Nenhum aplicativo encontrado")
+            vazio.get_style_context().add_class("vazio")
+            vazio.get_style_context().add_class("dim")
+            self.lista_apps.add(vazio)
+        for ai in apps:
+            self.lista_apps.add(self.linha(ai.get_display_name(), ai.get_icon(), 26, dados=ai,
+                                           ))
+        self.lista_apps.show_all()
+        self.titulo_apps.set_text(titulo)
+        self.stack.set_visible_child_name("apps")
+        self.botao_rodape.set_label("‹  Voltar")
+        self.modo = modo
+        sw = self.lista_apps.get_parent().get_parent()
+        sw.get_vadjustment().set_value(0)
+
+    def ao_escolher_categoria(self, _lista, row):
+        """Clique numa categoria: mostra os apps dela."""
+        nome, apps = row.dados
+        self.mostrar_apps(nome, apps, "categoria")
+        primeira = self.lista_apps.get_row_at_index(0)
+        if primeira and not self.busca.has_focus():
+            primeira.grab_focus()
+
+    def ao_rodape(self, _b):
+        """Botão do rodapé: 'Todos os aplicativos' ou 'Voltar', conforme a tela."""
+        if self.modo == "cats":
+            self.mostrar_apps("Todos os aplicativos", self.todos, "todos")
+        else:
+            self.busca.set_text("")
+            self.mostrar_categorias()
+
+    def iniciar_indice(self):
+        """Monta a lista de arquivos em segundo plano, para a busca ser instantânea."""
+        self.indice, self.recentes = None, []
+
+        def trabalho():
+            """Roda em outra thread: lê os recentes e varre a pasta pessoal."""
+            recentes = arquivos_recentes()
+            todos = indexar_arquivos()
+            GLib.idle_add(pronto, recentes, todos)
+
+        def pronto(recentes, todos):
+            """De volta na thread da interface: guarda o índice e refaz a busca se houver texto."""
+            self.recentes, self.indice = recentes, todos
+            if self.modo == "busca" and self.busca.get_text().strip():
+                self.ao_buscar(self.busca)
+            return False
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def buscar_arquivos(self, q, limite=6):
+        """Procura arquivos pelo nome (recentes primeiro). Só a partir de 3 letras."""
+        if len(q) < 3:
+            return []
+        candidatos = list(self.recentes) + list(self.indice or [])
+        vistos, achados = set(), []
+        for i, caminho in enumerate(candidatos):
+            if caminho in vistos:
+                continue
+            vistos.add(caminho)
+            nome = normalizar(os.path.basename(caminho))
+            if q in nome:
+                recente = i < len(self.recentes)
+                achados.append((0 if nome.startswith(q) else 1, 0 if recente else 1, len(nome), caminho))
+        achados.sort()
+        return [a[3] for a in achados[:limite]]
+
+    def mostrar_resultados(self, apps, extras_antes, configs, arquivos):
+        """Mostra os resultados da busca: conta, apps, configurações e arquivos."""
+        for filho in self.lista_apps.get_children():
+            self.lista_apps.remove(filho)
+
+        def cabecalho(texto):
+            """Título de grupo dentro da lista de resultados (não clicável)."""
+            row = Gtk.ListBoxRow(activatable=False, selectable=False)
+            rot = Gtk.Label(label=texto, xalign=0)
+            rot.get_style_context().add_class("dim")
+            rot.set_margin_top(6)
+            row.add(rot)
+            self.lista_apps.add(row)
+        for calc in extras_antes:
+            self.lista_apps.add(self.linha(f"= {calc['resultado']}", Gio.ThemedIcon.new("accessories-calculator"), 26,
+                                           dados=calc, subtitulo="Enter copia o resultado"))
+        if apps:
+            if extras_antes or configs or arquivos:
+                cabecalho("Aplicativos")
+            for ai in apps:
+                self.lista_apps.add(self.linha(ai.get_display_name(), ai.get_icon(), 26, dados=ai))
+        if configs:
+            cabecalho("Configurações")
+            for pid, nome, icone, _ in configs:
+                self.lista_apps.add(self.linha(nome, Gio.ThemedIcon.new(icone), 22,
+                                               dados={"tipo": "config", "pagina": pid}))
+        if arquivos:
+            cabecalho("Arquivos")
+            home = os.path.expanduser("~")
+            for caminho in arquivos:
+                gfile = Gio.File.new_for_path(caminho)
+                try:
+                    icone = gfile.query_info("standard::icon", 0, None).get_icon()
+                except GLib.Error:
+                    icone = Gio.ThemedIcon.new("text-x-generic")
+                row = self.linha(os.path.basename(caminho), icone, 22, dados={"tipo": "arquivo", "caminho": caminho},
+                                 subtitulo=os.path.dirname(caminho).replace(home, "~", 1))
+                for rot in row.get_child().get_children()[1].get_children():  # nomes longos: "…" no meio
+                    rot.set_ellipsize(2)
+                    rot.set_max_width_chars(28)
+                row.set_tooltip_text(caminho)
+                self.lista_apps.add(row)
+        if not (apps or extras_antes or configs or arquivos):
+            vazio = Gtk.Label(label="Nada encontrado")
+            vazio.get_style_context().add_class("vazio")
+            vazio.get_style_context().add_class("dim")
+            self.lista_apps.add(vazio)
+        self.lista_apps.show_all()
+        self.titulo_apps.set_text("Resultados da pesquisa")
+        self.stack.set_visible_child_name("apps")
+        self.botao_rodape.set_label("‹  Voltar")
+        self.modo = "busca"
+        self.lista_apps.get_parent().get_parent().get_vadjustment().set_value(0)
+
+    def ao_buscar(self, entrada):
+        """A cada letra digitada: calcula contas, procura apps, seções das Configurações e arquivos."""
+        texto = entrada.get_text().strip()
+        q = normalizar(texto)
+        if not q:
+            if self.modo == "busca":
+                self.mostrar_categorias()
+            return
+        resultado = calcular(texto)
+        contas = [{"tipo": "calc", "resultado": resultado}] if resultado is not None else []
+        configs = [c for c in CONFIG_PAGINAS if q in normalizar(c[1]) or q in normalizar(c[3])][:4]
+        achados = []
+        for ai in self.todos:
+            nome = normalizar(ai.get_display_name())
+            extras = " ".join(normalizar(x) for x in (
+                ai.get_generic_name(), ai.get_description(), ai.get_executable(), ai.get_id(),
+                " ".join(ai.get_keywords() or [])))
+            if nome.startswith(q):
+                achados.append((0, nome, ai))
+            elif q in nome:
+                achados.append((1, nome, ai))
+            elif q in extras:
+                achados.append((2, nome, ai))
+        achados.sort(key=lambda t: (t[0], t[1]))
+        apps = [t[2] for t in achados][:12]
+        arquivos = [] if contas else self.buscar_arquivos(q)
+        self.mostrar_resultados(apps, contas, configs, arquivos)
+
+    def ao_enter_busca(self, _e):
+        """Enter na busca: abre o primeiro resultado."""
+        if self.modo != "busca":
+            return
+        for row in self.lista_apps.get_children():
+            if getattr(row, "dados", None) is not None:
+                self.ativar(row.dados)
+                return
+
+    def ao_abrir_app(self, _lista, row):
+        """Clique num resultado: abre."""
+        if getattr(row, "dados", None) is not None:
+            self.ativar(row.dados)
+
+    def ativar(self, dados):
+        """Abre o item escolhido: app, resultado da conta (copia), seção das Configurações ou arquivo."""
+        if not isinstance(dados, dict):
+            self.abrir(dados)
+            return
+        if dados["tipo"] == "calc":
+            valor = dados["resultado"].replace(" ", "")
+            try:
+                subprocess.run(["wl-copy", valor], timeout=3)
+                subprocess.Popen(["notify-send", "-a", "Calculadora", "-i", "accessories-calculator",
+                                  "Resultado copiado", valor])
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            self.fechar()
+        elif dados["tipo"] == "config":
+            env = dict(os.environ, XDG_CURRENT_DESKTOP=ORIG_DESKTOP, CONFIG_PAGINA=dados["pagina"])
+            subprocess.Popen([os.path.expanduser("~/.local/bin/configuracoes")], env=env,
+                             start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.fechar()
+        elif dados["tipo"] == "arquivo":
+            try:
+                Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(dados["caminho"]), self.contexto())
+            except GLib.Error as erro:
+                print(f"menu-iniciar: não abriu {dados['caminho']}: {erro.message}", file=sys.stderr)
+            self.fechar()
+
+    def ao_tecla(self, _w, ev):
+        """Teclado: Esc volta/fecha, ↓ entra na lista, ← volta às categorias,
+        e qualquer letra vai direto para a busca.
+        """
+        tecla = ev.keyval
+        if tecla == Gdk.KEY_Escape:
+            if self.busca.get_text():
+                self.busca.set_text("")
+            elif self.modo != "cats":
+                self.mostrar_categorias()
+                self.lista_cats.get_row_at_index(0).grab_focus()
+            else:
+                self.fechar()
+            return True
+        if tecla == Gdk.KEY_Down and self.busca.has_focus():
+            lista = self.lista_cats if self.modo == "cats" else self.lista_apps
+            row = lista.get_row_at_index(0)
+            if row:
+                row.grab_focus()
+            return True
+        if tecla in (Gdk.KEY_Left, Gdk.KEY_BackSpace) and self.modo == "categoria" \
+                and not self.busca.has_focus():
+            self.mostrar_categorias()
+            self.lista_cats.get_row_at_index(0).grab_focus()
+            return True
+        if not self.busca.has_focus() and Gdk.keyval_to_unicode(tecla) >= 32:
+            self.busca.grab_focus_without_selecting()
+            return self.busca.handle_event(ev)
+        return False
+
+    # ---------- ações ----------
+    def contexto(self, ai=None):
+        """Contexto para abrir apps com o XDG_CURRENT_DESKTOP original
+        (o menu finge ser GNOME só para listar os mesmos apps que o Zorin Menu).
+        """
+        ctx = Gdk.Display.get_default().get_app_launch_context()
+        if ai is None or ai.get_id() not in SETTINGS_IDS:
+            if ORIG_DESKTOP:
+                ctx.setenv("XDG_CURRENT_DESKTOP", ORIG_DESKTOP)
+            else:
+                ctx.unsetenv("XDG_CURRENT_DESKTOP")
+        return ctx
+
+    def abrir(self, ai):
+        """Abre um app e fecha o menu."""
+        try:
+            ai.launch([], self.contexto(ai))
+        except GLib.Error as erro:
+            print(f"menu-iniciar: não abriu {ai.get_id()}: {erro.message}", file=sys.stderr)
+        self.fechar()
+
+    def abrir_pasta(self, _b, caminho):
+        """Abre uma pasta no gerenciador de arquivos padrão e fecha o menu."""
+        try:
+            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(caminho), self.contexto())
+        except GLib.Error as erro:
+            print(f"menu-iniciar: não abriu {caminho}: {erro.message}", file=sys.stderr)
+        self.fechar()
+
+    def ao_sessao(self, botao, dica, cmd, confirmar):
+        """Botões de sessão. Sair/Reiniciar/Desligar pedem um segundo clique."""
+        if confirmar and self._confirmar is not botao:
+            if self._confirmar is not None:
+                self._confirmar.get_style_context().remove_class("confirmar")
+            self._confirmar = botao
+            botao.get_style_context().add_class("confirmar")
+            self.aviso.set_text("Clique de novo")
+            botao.set_tooltip_text(f"Clique de novo para {dica.lower()}")
+            return
+        env = dict(os.environ, XDG_CURRENT_DESKTOP=ORIG_DESKTOP)
+        subprocess.Popen(cmd, env=env, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.fechar()
+
+    def aplicar_teste(self, teste):
+        """Usado só em testes (MENU_TESTE=busca:texto, categoria:N, todos)."""
+        tipo, _, valor = teste.partition(":")
+        if tipo == "busca":
+            self.busca.set_text(valor)
+        elif tipo == "categoria":
+            row = self.lista_cats.get_row_at_index(int(valor))
+            self.ao_escolher_categoria(self.lista_cats, row)
+        elif tipo == "todos":
+            self.ao_rodape(None)
+
+
+if __name__ == "__main__":
+    sys.exit(MenuIniciar().run(None))

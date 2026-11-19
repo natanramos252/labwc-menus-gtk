@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Bloqueia a tela com o papel de parede desfocado e a data, no visual dos menus.
+
+Gera (e guarda em cache) uma imagem do papel de parede atual desfocada e
+escurecida, com o dia da semana e a data, e chama o swaylock com as cores
+do tema. O swaylock do Ubuntu não desenha relógio ao vivo, por isso a imagem
+mostra a data, não a hora.
+"""
+import glob
+import hashlib
+import locale
+import os
+import re
+import subprocess
+import time
+
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(HOME, ".cache/labwc-bloqueio")
+FONTE = "/usr/share/fonts/truetype/inter-zorin-os/Inter-Light.ttf"
+FONTE_FORTE = "/usr/share/fonts/truetype/inter-zorin-os/Inter-SemiBold.ttf"
+
+CORES = {
+    "inside-color": "18182299", "inside-clear-color": "18182299", "inside-ver-color": "7aa2f766",
+    "inside-wrong-color": "f7768e66", "inside-caps-lock-color": "18182299",
+    "ring-color": "ffffff55", "ring-clear-color": "9ece6aff", "ring-ver-color": "7aa2f7ff",
+    "ring-wrong-color": "f7768eff", "ring-caps-lock-color": "ff9e64ff",
+    "line-color": "00000000", "line-clear-color": "00000000", "line-ver-color": "00000000",
+    "line-wrong-color": "00000000", "line-caps-lock-color": "00000000",
+    "separator-color": "00000000", "key-hl-color": "7aa2f7ff", "bs-hl-color": "f7768eff",
+    "caps-lock-key-hl-color": "ff9e64ff", "caps-lock-bs-hl-color": "f7768eff",
+    "text-color": "e6e6e6ff", "text-clear-color": "e6e6e6ff", "text-ver-color": "e6e6e6ff",
+    "text-wrong-color": "ffffffff", "text-caps-lock-color": "ff9e64ff",
+}
+
+
+def papel_de_parede():
+    """Lê no autostart do labwc qual imagem o swaybg usa como papel de parede."""
+    try:
+        m = re.search(r"swaybg -i (\S+)", open(os.path.join(HOME, ".config/labwc/autostart")).read())
+        if m:
+            caminho = os.path.expanduser(m.group(1))
+            if os.path.exists(caminho):
+                return caminho
+    except OSError:
+        pass
+    return None
+
+
+def tamanho_tela():
+    """Descobre a resolução do maior monitor ligado (via wlr-randr)."""
+    try:
+        saida = subprocess.run(["wlr-randr"], capture_output=True, text=True, timeout=3).stdout
+        tamanhos = [tuple(map(int, m)) for m in re.findall(r"(\d+)x(\d+) px[^\n]*current", saida)]
+        if tamanhos:
+            return max(tamanhos, key=lambda t: t[0] * t[1])
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return (1920, 1080)
+
+
+def data_por_extenso():
+    """Devolve o dia da semana e a data em português, ex.: ('Quinta-feira', '19 de novembro')."""
+    locale.setlocale(locale.LC_TIME, "")
+    dia = time.strftime("%A")
+    if dia in ("segunda", "terça", "quarta", "quinta", "sexta"):
+        dia += "-feira"
+    return dia[:1].upper() + dia[1:], time.strftime("%-d de %B")
+
+
+def gerar_imagem():
+    """Cria (ou reaproveita do cache) a imagem da tela de bloqueio:
+    papel de parede recortado no tamanho da tela, desfocado, escurecido e com a data.
+    """
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+
+    origem = papel_de_parede()
+    largura, altura = tamanho_tela()
+    dia, data = data_por_extenso()
+    chave = f"{origem}:{os.path.getmtime(origem) if origem else 0}:{largura}x{altura}:{dia}:{data}"
+    destino = os.path.join(CACHE, hashlib.sha1(chave.encode()).hexdigest()[:16] + ".png")
+    if os.path.exists(destino):
+        return destino
+    os.makedirs(CACHE, exist_ok=True)
+    for antigo in glob.glob(os.path.join(CACHE, "*.png")):  # guarda só a imagem do dia
+        os.remove(antigo)
+
+    if origem:
+        img = Image.open(origem).convert("RGB")
+        escala = max(largura / img.width, altura / img.height)  # preencher a tela, como o swaybg
+        img = img.resize((int(img.width * escala) + 1, int(img.height * escala) + 1), Image.LANCZOS)
+        x, y = (img.width - largura) // 2, (img.height - altura) // 2
+        img = img.crop((x, y, x + largura, y + altura))
+        pequeno = img.resize((largura // 4, altura // 4), Image.BILINEAR).filter(ImageFilter.GaussianBlur(6))
+        img = pequeno.resize((largura, altura), Image.BICUBIC)
+        img = ImageEnhance.Brightness(img).enhance(0.55)
+    else:
+        img = Image.new("RGB", (largura, altura), (24, 24, 34))
+
+    desenho = ImageDraw.Draw(img)
+    f_dia = ImageFont.truetype(FONTE, max(18, altura // 32))
+    f_data = ImageFont.truetype(FONTE_FORTE, max(30, altura // 14))
+
+    def centralizado(texto, fonte, y_meio, cor):
+        """Escreve um texto centralizado na horizontal, com o meio na altura y_meio."""
+        caixa = desenho.textbbox((0, 0), texto, font=fonte)
+        w, h = caixa[2] - caixa[0], caixa[3] - caixa[1]
+        desenho.text(((largura - w) / 2 - caixa[0], y_meio - h / 2 - caixa[1]), texto, font=fonte, fill=cor)
+
+    centralizado(dia, f_dia, altura * 0.20, (230, 230, 230))
+    centralizado(data, f_data, altura * 0.20 + altura // 13, (255, 255, 255))
+    img.save(destino)
+    return destino
+
+
+def main():
+    """Monta os argumentos do swaylock (imagem + cores do tema) e o executa no lugar deste script."""
+    args = ["swaylock", "-f", "-e", "-F", "-l", "--indicator-idle-visible",
+            "--indicator-radius", "64", "--indicator-thickness", "6", "--font", "Inter"]
+    try:
+        args += ["-i", gerar_imagem(), "-s", "fill"]
+    except Exception:  # sem PIL ou imagem com problema: bloqueia mesmo assim
+        args += ["-c", "181822"]
+    for nome, cor in CORES.items():
+        args += [f"--{nome}", cor]
+    os.execvp("swaylock", args)
+
+
+if __name__ == "__main__":
+    main()

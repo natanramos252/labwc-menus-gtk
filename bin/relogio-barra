@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Relógio da barra: data em português, ponto azul se há notificações novas
+e sino cortado quando o "não perturbe" está ligado (como no GNOME)."""
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.expanduser("~/.local/share/labwc-menus"))
+import notificacoes  # noqa: E402
+
+data = subprocess.run(["date", "+%a %-d de %b  %H:%M"], capture_output=True, text=True,
+                      env=dict(os.environ, LC_TIME="pt_BR.UTF-8")).stdout.strip()
+texto, classes, dica = data, [], "Clique: calendário e notificações"
+if notificacoes.nao_perturbe():
+    texto = "  " + texto
+    classes.append("nao-perturbe")
+    dica += "\nNão perturbe ligado"
+elif notificacoes.novas():
+    texto = texto + "  ●"
+    classes.append("novas")
+print(json.dumps({"text": texto, "class": classes, "tooltip": dica}))

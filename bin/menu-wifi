@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""Menu de Wi-Fi para a barra do labwc, no mesmo visual do menu-iniciar.
+
+Fecha sozinho: ao clicar em outra janela, ao clicar de novo no Wi-Fi da barra,
+com Esc e depois de conectar. A senha é pedida dentro do próprio menu.
+Teste: MENU_TESTE=1 mantém aberto mesmo sem foco.
+"""
+import os
+import re
+import subprocess
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "org.labwc.MenuWifi"
+GLib.set_prgname(APP_ID)
+TITULO = "Rede Wi-Fi"  # usado na regra de janela do rc.xml
+CLOSED_STAMP = os.path.join(GLib.get_user_runtime_dir(), "menu-wifi.closed")
+TESTE = os.environ.get("MENU_TESTE")
+
+CSS = b"""
+window.menu-wifi { background-color: transparent; }
+#menu {
+  background-color: rgba(24, 24, 34, 0.985);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 10px;
+}
+#menu, #menu label, #menu image { color: #e6e6e6; }
+#menu .dim { color: #9a9aa8; font-size: 12px; }
+#menu .erro { color: #f7768e; font-size: 12px; }
+#menu .titulo { font-weight: bold; }
+#menu list, #menu scrolledwindow, #menu viewport { background: transparent; }
+#menu row { padding: 4px 8px; border-radius: 8px; }
+#menu row:hover { background-color: rgba(255, 255, 255, 0.08); }
+#menu row:selected, #menu row:focus { background-color: rgba(255, 255, 255, 0.15); outline: none; }
+#menu button {
+  background: transparent; border: none; box-shadow: none;
+  border-radius: 8px; padding: 5px 8px; color: #e6e6e6;
+}
+#menu button:hover { background-color: rgba(255, 255, 255, 0.10); }
+#menu button.conectar { background-color: rgba(122, 162, 247, 0.85); color: #10121a; }
+#menu entry {
+  background-color: rgba(255, 255, 255, 0.08); color: #eeeeee;
+  border: none; box-shadow: none; border-radius: 18px; padding: 6px 12px;
+}
+#menu entry:focus { background-color: rgba(255, 255, 255, 0.14); }
+#menu .separador { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; margin: 6px 2px; }
+"""
+
+
+def nmcli(*args):
+    """Executa o nmcli (NetworkManager) e devolve o resultado."""
+    return subprocess.run(["nmcli", *args], capture_output=True, text=True)
+
+
+def campos(linha):
+    """Separa uma linha de saída do 'nmcli -t' respeitando ':' escapados no nome da rede."""
+    partes = re.split(r"(?<!\\):", linha)
+    return [p.replace("\\:", ":").replace("\\\\", "\\") for p in partes]
+
+
+def wifi_ligado():
+    """Diz se o rádio Wi-Fi está ligado."""
+    return nmcli("radio", "wifi").stdout.strip() == "enabled"
+
+
+def listar_redes():
+    """Lista as redes visíveis (a atual primeiro, depois por sinal), sem repetir nomes."""
+    saida = nmcli("-t", "-f", "IN-USE,SIGNAL,SECURITY,SSID", "device", "wifi", "list",
+                  "--rescan", "no").stdout
+    melhores = {}
+    for linha in saida.splitlines():
+        c = campos(linha)
+        if len(c) < 4 or not c[3]:
+            continue
+        em_uso, sinal, segura, ssid = c[0] == "*", int(c[1] or 0), bool(c[2].strip()), c[3]
+        atual = melhores.get(ssid)
+        if atual is None or em_uso or (sinal > atual["sinal"] and not atual["em_uso"]):
+            melhores[ssid] = {"ssid": ssid, "sinal": sinal, "segura": segura,
+                              "em_uso": em_uso or (atual or {}).get("em_uso", False)}
+    return sorted(melhores.values(), key=lambda r: (not r["em_uso"], -r["sinal"]))
+
+
+def redes_salvas():
+    """Nomes das redes Wi-Fi já salvas no NetworkManager."""
+    saida = nmcli("-t", "-f", "NAME,TYPE", "connection", "show").stdout
+    return {campos(l)[0] for l in saida.splitlines() if l.endswith(":802-11-wireless")}
+
+
+def icone_sinal(sinal):
+    """Escolhe o ícone de sinal (fraco, ok, bom, excelente)."""
+    nivel = "excellent" if sinal >= 75 else "good" if sinal >= 50 else "ok" if sinal >= 25 else "weak"
+    return f"network-wireless-signal-{nivel}-symbolic"
+
+
+def avisar(titulo, texto=""):
+    """Mostra uma notificação."""
+    subprocess.Popen(["notify-send", "-a", "Wi-Fi", "-i", "network-wireless", titulo, texto],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def separador():
+    """Linha fina horizontal."""
+    s = Gtk.Box()
+    s.get_style_context().add_class("separador")
+    return s
+
+
+class MenuWifi(Gtk.Application):
+    """Menu do Wi-Fi: chave liga/desliga, redes, senha embutida e atalhos."""
+    def __init__(self):
+        """Prepara o app de instância única."""
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win = None
+        self.ocupado = False
+        self.rede_senha = None
+
+    # ---------- abrir / fechar ----------
+    def do_activate(self):
+        """Abre o menu; se já estiver aberto (clique de novo no Wi-Fi), fecha."""
+        if self.win is not None:  # clicou de novo no Wi-Fi da barra: fecha
+            self.fechar()
+            return
+        try:  # o clique que tirou o foco já fechou o menu: não reabrir
+            if time.time() - os.path.getmtime(CLOSED_STAMP) < 0.4:
+                self.quit()
+                return
+        except OSError:
+            pass
+        self.construir()
+        self.recarregar()
+        # varredura nova em segundo plano; a lista se atualiza quando terminar
+        threading.Thread(target=self._varrer, daemon=True).start()
+
+    def fechar(self, marcar=False):
+        """Fecha o menu. Com marcar=True, anota a hora para o clique que tirou o foco não reabri-lo."""
+        if marcar:
+            try:
+                with open(CLOSED_STAMP, "w"):
+                    pass
+            except OSError:
+                pass
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+        self.quit()
+
+    def ao_perder_foco(self, *_):
+        """Fecha ao clicar em outra janela (menos enquanto conecta)."""
+        if not TESTE and not self.ocupado:
+            self.fechar(marcar=True)
+        return False
+
+    # ---------- interface ----------
+    def construir(self):
+        """Monta a janela sem moldura no visual dos menus."""
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+
+        win = self.win = Gtk.ApplicationWindow(application=self, title=TITULO)
+        win.get_style_context().add_class("menu-wifi")
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_app_paintable(True)
+        visual = win.get_screen().get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+
+        raiz = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        raiz.set_name("menu")
+        raiz.set_size_request(300, -1)
+        win.add(raiz)
+
+        # cabeçalho: título + chave liga/desliga
+        topo = Gtk.Box(spacing=8)
+        topo.set_margin_start(8)
+        topo.set_margin_end(4)
+        titulo = Gtk.Label(label="Wi-Fi", xalign=0)
+        titulo.get_style_context().add_class("titulo")
+        topo.pack_start(titulo, True, True, 0)
+        self.chave = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.chave.connect("notify::active", self.ao_chave)
+        topo.pack_end(self.chave, False, False, 0)
+        raiz.pack_start(topo, False, False, 4)
+        raiz.pack_start(separador(), False, False, 0)
+
+        # lista de redes
+        self.lista = Gtk.ListBox()
+        self.lista.connect("row-activated", self.ao_escolher)
+        self.rolagem = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.rolagem.set_propagate_natural_height(True)
+        self.rolagem.set_max_content_height(380)
+        self.rolagem.add(self.lista)
+        raiz.pack_start(self.rolagem, True, True, 0)
+
+        # senha (aparece só quando precisa)
+        self.caixa_senha = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.rotulo_senha = Gtk.Label(xalign=0)
+        self.rotulo_senha.get_style_context().add_class("dim")
+        self.rotulo_senha.set_margin_start(8)
+        self.caixa_senha.pack_start(self.rotulo_senha, False, False, 0)
+        linha = Gtk.Box(spacing=6)
+        self.senha = Gtk.Entry(visibility=False, placeholder_text="Senha")
+        self.senha.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+        self.senha.connect("activate", self.ao_conectar_senha)
+        self.senha.connect("icon-press", lambda e, *_: e.set_visibility(not e.get_visibility()))
+        self.senha.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
+        self.senha.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY, "Mostrar senha")
+        linha.pack_start(self.senha, True, True, 0)
+        conectar = Gtk.Button(label="Conectar")
+        conectar.get_style_context().add_class("conectar")
+        conectar.connect("clicked", self.ao_conectar_senha)
+        linha.pack_start(conectar, False, False, 0)
+        self.caixa_senha.pack_start(linha, False, False, 0)
+        self.revelar = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.revelar.add(self.caixa_senha)
+        raiz.pack_start(self.revelar, False, False, 0)
+
+        # status / erro
+        self.status = Gtk.Label(xalign=0)
+        self.status.set_margin_start(8)
+        self.status.set_no_show_all(True)
+        raiz.pack_start(self.status, False, False, 0)
+
+        # rodapé
+        raiz.pack_start(separador(), False, False, 0)
+        self.botao_desconectar = Gtk.Button(label="Desconectar")
+        self.botao_desconectar.get_child().set_xalign(0)
+        self.botao_desconectar.connect("clicked", self.ao_desconectar)
+        raiz.pack_start(self.botao_desconectar, False, False, 0)
+        config = Gtk.Button(label="Configurações de rede…")
+        config.get_child().set_xalign(0)
+        config.connect("clicked", self.ao_configurar)
+        raiz.pack_start(config, False, False, 0)
+
+        win.connect("key-press-event", self.ao_tecla)
+        win.connect("focus-out-event", self.ao_perder_foco)
+        win.show_all()
+
+    def mostrar_status(self, texto, erro=False):
+        """Mostra uma mensagem (normal ou erro) abaixo da lista."""
+        ctx = self.status.get_style_context()
+        ctx.remove_class("erro")
+        ctx.remove_class("dim")
+        ctx.add_class("erro" if erro else "dim")
+        self.status.set_text(texto)
+        self.status.set_visible(bool(texto))
+
+    def recarregar(self):
+        """Atualiza a chave e a lista de redes."""
+        if self.win is None:
+            return False
+        ligado = wifi_ligado()
+        self.chave.handler_block_by_func(self.ao_chave)
+        self.chave.set_active(ligado)
+        self.chave.handler_unblock_by_func(self.ao_chave)
+        for filho in self.lista.get_children():
+            self.lista.remove(filho)
+        redes = listar_redes() if ligado else []
+        if not ligado:
+            vazio = Gtk.Label(label="Wi-Fi desligado")
+            vazio.get_style_context().add_class("dim")
+            vazio.set_margin_top(12)
+            vazio.set_margin_bottom(12)
+            self.lista.add(vazio)
+        for rede in redes:
+            self.lista.add(self.linha(rede))
+        self.lista.show_all()
+        self.botao_desconectar.set_visible(any(r["em_uso"] for r in redes))
+        return False
+
+    def linha(self, rede):
+        """Cria a linha de uma rede: sinal, nome, ✓ se conectada e cadeado se tiver senha."""
+        row = Gtk.ListBoxRow()
+        row.rede = rede
+        caixa = Gtk.Box(spacing=10)
+        sinal = Gtk.Image.new_from_icon_name(icone_sinal(rede["sinal"]), Gtk.IconSize.MENU)
+        sinal.set_tooltip_text(f"Sinal {rede['sinal']}%")
+        caixa.pack_start(sinal, False, False, 0)
+        nome = Gtk.Label(label=rede["ssid"], xalign=0)
+        if rede["em_uso"]:
+            nome.get_style_context().add_class("titulo")
+        caixa.pack_start(nome, True, True, 0)
+        if rede["segura"]:
+            caixa.pack_end(Gtk.Image.new_from_icon_name("changes-prevent-symbolic", Gtk.IconSize.MENU),
+                           False, False, 0)
+        if rede["em_uso"]:
+            caixa.pack_end(Gtk.Image.new_from_icon_name("object-select-symbolic", Gtk.IconSize.MENU),
+                           False, False, 0)
+        row.add(caixa)
+        return row
+
+    # ---------- ações ----------
+    def em_segundo_plano(self, texto, funcao, ao_terminar):
+        """Roda uma ação demorada (nmcli) numa thread, sem travar a janela."""
+        self.ocupado = True
+        self.mostrar_status(texto)
+
+        def trabalho():
+            """Executa a função pesada fora da interface."""
+            resultado = funcao()
+            GLib.idle_add(fim, resultado)
+
+        def fim(resultado):
+            """De volta na interface: libera e chama ao_terminar."""
+            self.ocupado = False
+            ao_terminar(resultado)
+            return False
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _varrer(self):
+        """Pede uma nova varredura de redes e atualiza a lista alguns segundos depois."""
+        nmcli("device", "wifi", "rescan")
+        time.sleep(2)
+        GLib.idle_add(lambda: (not self.ocupado and self.rede_senha is None) and self.recarregar())
+
+    def ao_chave(self, chave, _param):
+        """Liga/desliga o Wi-Fi."""
+        estado = "on" if chave.get_active() else "off"
+        self.em_segundo_plano("Ligando Wi-Fi…" if estado == "on" else "Desligando Wi-Fi…",
+                              lambda: nmcli("radio", "wifi", estado),
+                              lambda _r: (self.mostrar_status(""), self.recarregar(),
+                                          GLib.timeout_add(3000, self.recarregar)))
+
+    def ao_escolher(self, _lista, row):
+        """Clique numa rede: conecta (salva), pede senha (nova com senha) ou conecta direto (aberta)."""
+        rede = getattr(row, "rede", None)
+        if rede is None or self.ocupado:
+            return
+        if rede["em_uso"]:
+            self.mostrar_status(f"Já conectado a {rede['ssid']}")
+            return
+        if rede["ssid"] in redes_salvas():
+            self.conectar(rede, nmcli_args=("connection", "up", "id", rede["ssid"]))
+        elif rede["segura"]:
+            self.pedir_senha(rede)
+        else:
+            self.conectar(rede, nmcli_args=("device", "wifi", "connect", rede["ssid"]))
+
+    def pedir_senha(self, rede, erro=None):
+        """Mostra o campo de senha embutido para a rede escolhida."""
+        self.rede_senha = rede
+        self.rotulo_senha.set_text(f"Senha de {rede['ssid']}")
+        self.senha.set_text("")
+        self.revelar.set_reveal_child(True)
+        self.senha.grab_focus()
+        self.mostrar_status(erro or "", erro=bool(erro))
+
+    def ao_conectar_senha(self, *_):
+        """Enter ou botão Conectar no campo de senha."""
+        rede, senha = self.rede_senha, self.senha.get_text()
+        if rede is None or not senha or self.ocupado:
+            return
+        self.conectar(rede, nmcli_args=("device", "wifi", "connect", rede["ssid"], "password", senha),
+                      com_senha=True)
+
+    def conectar(self, rede, nmcli_args, com_senha=False):
+        """Conecta em segundo plano; se der certo, avisa e fecha; se a senha falhar, pede de novo."""
+        ssid = rede["ssid"]
+
+        def terminou(r):
+            """Trata o resultado da conexão."""
+            if r.returncode == 0:
+                avisar(f"Conectado a {ssid}")
+                self.fechar()
+                return
+            msg = (r.stderr or r.stdout).strip().splitlines()
+            msg = msg[-1] if msg else "erro desconhecido"
+            if rede["segura"] and ("Secrets" in msg or "senha" in msg.lower() or com_senha
+                                   or "connection up" in " ".join(nmcli_args)):
+                self.pedir_senha(rede, erro="Não conectou. Confira a senha.")
+            else:
+                self.mostrar_status(f"Não conectou: {msg}", erro=True)
+
+        self.em_segundo_plano(f"Conectando a {ssid}…", lambda: nmcli(*nmcli_args), terminou)
+
+    def ao_desconectar(self, _b):
+        """Desconecta o Wi-Fi atual."""
+        def desconectar():
+            """Desconecta todos os dispositivos Wi-Fi conectados."""
+            disp = [campos(l)[0] for l in nmcli("-t", "-f", "DEVICE,TYPE,STATE", "device").stdout.splitlines()
+                    if ":wifi:connected" in l]
+            for d in disp:
+                nmcli("device", "disconnect", d)
+
+        self.em_segundo_plano("Desconectando…", desconectar,
+                              lambda _r: (self.mostrar_status(""), self.recarregar()))
+
+    def ao_configurar(self, _b):
+        """Abre o editor de conexões do NetworkManager e fecha o menu."""
+        subprocess.Popen(["nm-connection-editor"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.fechar()
+
+    def ao_tecla(self, _w, ev):
+        """Esc fecha o campo de senha; se ele não estiver aberto, fecha o menu."""
+        if ev.keyval == Gdk.KEY_Escape:
+            if self.revelar.get_reveal_child():
+                self.revelar.set_reveal_child(False)
+                self.rede_senha = None
+                self.mostrar_status("")
+            else:
+                self.fechar()
+            return True
+        return False
+
+
+if __name__ == "__main__":
+    MenuWifi().run(None)

@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Menu de energia do botão ⏻ da barra (labwc), no visual do menu-wifi.
+
+Abre logo abaixo do botão. Sair, Reiniciar e Desligar pedem um segundo clique.
+Fecha ao clicar de novo no ⏻, ao clicar em outra janela ou com Esc.
+Teste: MENU_TESTE=1 mantém aberto mesmo sem foco.
+"""
+import os
+import shutil
+import subprocess
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+
+# Comando de bloqueio de tela: usa o script "bloquear" deste repositório se estiver
+# instalado no PATH; senão, cai no swaylock puro.
+BLOQUEAR = shutil.which("bloquear") or "swaylock"
+APP_ID = "org.labwc.MenuEnergia"
+GLib.set_prgname(APP_ID)
+TITULO = "Energia"  # usado na regra de janela do rc.xml
+CLOSED_STAMP = os.path.join(GLib.get_user_runtime_dir(), "menu-energia.closed")
+TESTE = os.environ.get("MENU_TESTE")
+
+ACOES = [
+    # (rótulo, ícone, comando, pede confirmação)
+    ("Bloquear", "system-lock-screen-symbolic", [BLOQUEAR], False),
+    ("Suspender", "media-playback-pause-symbolic", ["systemctl", "suspend"], False),
+    ("Sair da sessão", "system-log-out-symbolic", ["labwc", "--exit"], True),
+    ("Reiniciar", "system-reboot-symbolic", ["systemctl", "reboot"], True),
+    ("Desligar", "system-shutdown-symbolic", ["systemctl", "poweroff"], True),
+]
+
+CSS = b"""
+window.menu-energia { background-color: transparent; }
+#menu {
+  background-color: rgba(24, 24, 34, 0.985);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 8px;
+}
+#menu, #menu label, #menu image { color: #e6e6e6; }
+#menu .dim { color: #9a9aa8; font-size: 12px; }
+#menu list { background: transparent; }
+#menu row { padding: 7px 10px; border-radius: 8px; }
+#menu row:hover { background-color: rgba(255, 255, 255, 0.08); }
+#menu row:selected, #menu row:focus { background-color: rgba(255, 255, 255, 0.15); outline: none; }
+#menu row.confirmar, #menu row.confirmar:hover, #menu row.confirmar:selected { background-color: #c0392b; }
+#menu row.confirmar label, #menu row.confirmar image { color: #ffffff; }
+#menu .separador { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; margin: 4px 2px; }
+"""
+
+
+class MenuEnergia(Gtk.Application):
+    """Menu do botão ⏻: bloquear, suspender, sair, reiniciar e desligar."""
+    def __init__(self):
+        """Prepara o app de instância única."""
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win = None
+        self.pendente = None
+
+    def do_activate(self):
+        """Abre o menu; se já estiver aberto (clique de novo no ⏻), fecha."""
+        if self.win is not None:  # clicou de novo no ⏻: fecha
+            self.fechar()
+            return
+        try:  # o clique que tirou o foco já fechou o menu: não reabrir
+            if time.time() - os.path.getmtime(CLOSED_STAMP) < 0.4:
+                self.quit()
+                return
+        except OSError:
+            pass
+        self.construir()
+
+    def fechar(self, marcar=False):
+        """Fecha o menu. Com marcar=True, anota a hora para o clique que tirou o foco não reabri-lo."""
+        if marcar:
+            try:
+                with open(CLOSED_STAMP, "w"):
+                    pass
+            except OSError:
+                pass
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+        self.quit()
+
+    def construir(self):
+        """Monta a janela sem moldura com a lista de ações."""
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+
+        win = self.win = Gtk.ApplicationWindow(application=self, title=TITULO)
+        win.get_style_context().add_class("menu-energia")
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_app_paintable(True)
+        visual = win.get_screen().get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+
+        raiz = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        raiz.set_name("menu")
+        raiz.set_size_request(220, -1)
+        win.add(raiz)
+
+        self.lista = Gtk.ListBox()
+        self.lista.set_selection_mode(Gtk.SelectionMode.NONE)  # sem o destaque azul do tema
+        self.lista.connect("row-activated", self.ao_escolher)
+        for i, (rotulo, icone, cmd, confirmar) in enumerate(ACOES):
+            if i == 2:  # separa bloquear/suspender do resto, como no GNOME
+                sep_row = Gtk.ListBoxRow(selectable=False, activatable=False)
+                sep = Gtk.Box()
+                sep.get_style_context().add_class("separador")
+                sep_row.add(sep)
+                self.lista.add(sep_row)
+            row = Gtk.ListBoxRow()
+            row.acao = (rotulo, cmd, confirmar)
+            caixa = Gtk.Box(spacing=12)
+            img = Gtk.Image.new_from_icon_name(icone, Gtk.IconSize.MENU)
+            caixa.pack_start(img, False, False, 0)
+            row.rotulo = Gtk.Label(label=rotulo, xalign=0)
+            caixa.pack_start(row.rotulo, True, True, 0)
+            row.add(caixa)
+            self.lista.add(row)
+        raiz.pack_start(self.lista, False, False, 0)
+
+        self.aviso = Gtk.Label(label="")
+        self.aviso.get_style_context().add_class("dim")
+        self.aviso.set_no_show_all(True)
+        raiz.pack_start(self.aviso, False, False, 2)
+
+        win.connect("key-press-event", self.ao_tecla)
+        win.connect("focus-out-event", lambda *a: (not TESTE) and self.fechar(marcar=True))
+        win.show_all()
+
+    def limpar_pendente(self):
+        """Cancela a confirmação pendente (volta a linha vermelha ao normal)."""
+        if self.pendente is not None:
+            self.pendente.get_style_context().remove_class("confirmar")
+            self.pendente.rotulo.set_text(self.pendente.acao[0])
+            self.pendente = None
+        self.aviso.hide()
+
+    def ao_escolher(self, _lista, row):
+        """Executa a ação. Sair/Reiniciar/Desligar pedem um segundo clique para confirmar."""
+        acao = getattr(row, "acao", None)
+        if acao is None:
+            return
+        rotulo, cmd, confirmar = acao
+        if confirmar and self.pendente is not row:
+            self.limpar_pendente()
+            self.pendente = row
+            row.get_style_context().add_class("confirmar")
+            row.rotulo.set_text(f"{rotulo}?  Clique de novo")
+            return
+        subprocess.Popen(cmd, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.fechar()
+
+    def ao_tecla(self, _w, ev):
+        """Esc cancela a confirmação; se não houver nenhuma, fecha o menu."""
+        if ev.keyval == Gdk.KEY_Escape:
+            if self.pendente is not None:
+                self.limpar_pendente()
+            else:
+                self.fechar()
+            return True
+        return False
+
+
+if __name__ == "__main__":
+    MenuEnergia().run(None)

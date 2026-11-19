@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Calendário que abre ao clicar na data da barra (labwc), como o do GNOME.
+
+Mesmo visual do menu-iniciar e do menu-wifi. Fecha ao clicar de novo na data,
+ao clicar em outra janela ou com Esc.
+Teste: MENU_TESTE=1 mantém aberto mesmo sem foco.
+"""
+import importlib.machinery
+import importlib.util
+import locale
+import os
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+
+sys.path.insert(0, os.path.expanduser("~/.local/share/labwc-menus"))
+import notificacoes  # noqa: E402
+
+locale.setlocale(locale.LC_ALL, "")
+APP_ID = "org.labwc.MenuCalendario"
+GLib.set_prgname(APP_ID)
+TITULO = "Calendário"  # usado na regra de janela do rc.xml
+CLOSED_STAMP = os.path.join(GLib.get_user_runtime_dir(), "menu-calendario.closed")
+TESTE = os.environ.get("MENU_TESTE")
+
+CSS = b"""
+window.menu-calendario { background-color: transparent; }
+#menu {
+  background-color: rgba(24, 24, 34, 0.985);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 14px;
+}
+#menu, #menu label, #menu image { color: #e6e6e6; }
+#menu .dia-semana { color: #9a9aa8; font-size: 13px; }
+#menu .data { font-size: 20px; font-weight: bold; }
+#menu button {
+  background: transparent; border: none; box-shadow: none;
+  border-radius: 8px; padding: 5px 10px; color: #e6e6e6;
+}
+#menu button:hover { background-color: rgba(255, 255, 255, 0.10); }
+#menu .separador { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; margin: 8px 0; }
+
+#menu calendar {
+  background: transparent;
+  color: #e6e6e6;
+  border: none;
+  padding: 2px;
+}
+#menu calendar.header { background: transparent; border: none; color: #e6e6e6; }
+#menu calendar.button { color: #e6e6e6; }
+#menu calendar.button:hover { color: #ffffff; }
+#menu calendar.highlight { color: #9a9aa8; font-weight: bold; }
+#menu calendar:indeterminate { color: rgba(230, 230, 230, 0.30); }
+#menu calendar:selected {
+  background-color: rgba(122, 162, 247, 0.90);
+  color: #10121a;
+  border-radius: 8px;
+}
+#menu .separador-v { background-color: rgba(255, 255, 255, 0.10); min-width: 1px; margin: 0 14px; }
+#menu .titulo-notif { font-weight: bold; }
+#menu .dim { color: #9a9aa8; font-size: 12px; }
+#menu .notif-titulo { font-weight: bold; }
+#menu .notif-texto { color: #c8c8d2; }
+#menu list, #menu scrolledwindow, #menu viewport { background: transparent; }
+#menu row { padding: 8px 8px; border-radius: 10px; margin-bottom: 4px; background-color: rgba(255, 255, 255, 0.05); }
+#menu row:hover { background-color: rgba(255, 255, 255, 0.09); }
+#menu row.urgente { border-left: 3px solid #f7768e; }
+#menu button.fechar { padding: 2px; border-radius: 12px; }
+#menu .vazio { color: #6c6c7c; }
+"""
+
+
+def carregar_configuracoes():
+    """Usa as funções do app Configurações para o "não perturbe" ficar igual nos dois lugares."""
+    caminho = os.path.expanduser("~/.local/bin/configuracoes")
+    loader = importlib.machinery.SourceFileLoader("configuracoes_app", caminho)
+    spec = importlib.util.spec_from_loader("configuracoes_app", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def icone_notificacao(n, tamanho=32):
+    """Escolhe o ícone de uma notificação: arquivo enviado pelo app, ícone do tema,
+    ícone do app que a enviou ou um ícone genérico.
+    """
+    icone = n["icone"]
+    if icone.startswith("file://"):
+        icone = icone[7:]
+    if icone and os.path.isfile(icone):
+        try:
+            return Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(icone, tamanho, tamanho, True))
+        except GLib.Error:
+            pass
+    if icone and Gtk.IconTheme.get_default().has_icon(icone):
+        img = Gtk.Image.new_from_icon_name(icone, Gtk.IconSize.DIALOG)
+        img.set_pixel_size(tamanho)
+        return img
+    if n["desktop"]:
+        try:
+            ai = Gio.DesktopAppInfo.new(n["desktop"] + ".desktop")
+        except TypeError:
+            ai = None
+        if ai and ai.get_icon():
+            img = Gtk.Image.new_from_gicon(ai.get_icon(), Gtk.IconSize.DIALOG)
+            img.set_pixel_size(tamanho)
+            return img
+    img = Gtk.Image.new_from_icon_name("dialog-information-symbolic", Gtk.IconSize.DIALOG)
+    img.set_pixel_size(tamanho - 8)
+    return img
+
+
+def separador():
+    """Linha fina horizontal entre partes do painel."""
+    s = Gtk.Box()
+    s.get_style_context().add_class("separador")
+    return s
+
+
+class Calendario(Gtk.Application):
+    """Painel da data: notificações à esquerda e calendário à direita (como no GNOME)."""
+    def __init__(self):
+        """Prepara o app de instância única."""
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.win = None
+
+    def do_activate(self):
+        """Abre o painel; se já estiver aberto (clique de novo na data), fecha."""
+        if self.win is not None:  # clicou de novo na data: fecha
+            self.fechar()
+            return
+        try:  # o clique que tirou o foco já fechou: não reabrir
+            if time.time() - os.path.getmtime(CLOSED_STAMP) < 0.4:
+                self.quit()
+                return
+        except OSError:
+            pass
+        self.construir()
+
+    def fechar(self, marcar=False):
+        """Fecha o painel. Com marcar=True, anota a hora para o clique que tirou o foco não reabri-lo."""
+        if marcar:
+            try:
+                with open(CLOSED_STAMP, "w"):
+                    pass
+            except OSError:
+                pass
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+        self.quit()
+
+    def construir(self):
+        """Monta a janela sem moldura com as duas colunas."""
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+
+        win = self.win = Gtk.ApplicationWindow(application=self, title=TITULO)
+        win.get_style_context().add_class("menu-calendario")
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.set_app_paintable(True)
+        visual = win.get_screen().get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+
+        geral = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        geral.set_name("menu")
+        win.add(geral)
+
+        # ---- coluna das notificações (esquerda, como no GNOME) ----
+        geral.pack_start(self.coluna_notificacoes(), False, False, 0)
+        sep_v = Gtk.Box()
+        sep_v.get_style_context().add_class("separador-v")
+        geral.pack_start(sep_v, False, False, 0)
+
+        # ---- coluna do calendário (direita) ----
+        raiz = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        raiz.set_size_request(300, -1)
+        geral.pack_start(raiz, False, False, 0)
+
+        # cabeçalho como no GNOME: dia da semana + data por extenso
+        agora = GLib.DateTime.new_now_local()
+        dia_semana = agora.format("%A")
+        if dia_semana in ("segunda", "terça", "quarta", "quinta", "sexta"):
+            dia_semana += "-feira"  # o glibc abrevia; o GNOME mostra "quinta-feira"
+        semana = Gtk.Label(label=dia_semana[:1].upper() + dia_semana[1:], xalign=0)
+        semana.get_style_context().add_class("dia-semana")
+        data = Gtk.Label(label=agora.format("%-d de %B de %Y"), xalign=0)
+        data.get_style_context().add_class("data")
+        cabecalho = Gtk.Box(spacing=8)
+        textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        textos.pack_start(semana, False, False, 0)
+        textos.pack_start(data, False, False, 0)
+        cabecalho.pack_start(textos, True, True, 0)
+        self.botao_hoje = Gtk.Button(label="Hoje", valign=Gtk.Align.CENTER)
+        self.botao_hoje.connect("clicked", lambda _b: self.ir_para_hoje())
+        cabecalho.pack_end(self.botao_hoje, False, False, 0)
+        raiz.pack_start(cabecalho, False, False, 0)
+        raiz.pack_start(separador(), False, False, 0)
+
+        self.cal = Gtk.Calendar()
+        self.cal.set_display_options(Gtk.CalendarDisplayOptions.SHOW_HEADING
+                                     | Gtk.CalendarDisplayOptions.SHOW_DAY_NAMES)
+        self.cal.connect("month-changed", self.ao_mudar_mes)
+        raiz.pack_start(self.cal, False, False, 0)
+
+        self.ir_para_hoje()
+
+        win.connect("key-press-event", self.ao_tecla)
+        win.connect("focus-out-event", lambda *a: (not TESTE) and self.fechar(marcar=True))
+        win.show_all()
+        self.ao_mudar_mes(self.cal)
+
+    # ---------- notificações ----------
+    def coluna_notificacoes(self):
+        """Monta a coluna de notificações e marca todas como vistas (tira o ponto do relógio)."""
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        col.set_size_request(330, -1)
+        titulo = Gtk.Label(label="Notificações", xalign=0)
+        titulo.get_style_context().add_class("titulo-notif")
+        col.pack_start(titulo, False, False, 0)
+
+        self.lista_notif = Gtk.ListBox()
+        self.lista_notif.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.lista_notif.connect("row-activated", self.ao_abrir_notificacao)
+        rol = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        rol.set_size_request(-1, 300)
+        rol.add(self.lista_notif)
+        col.pack_start(rol, True, True, 0)
+
+        rodape = Gtk.Box(spacing=8)
+        rodape.pack_start(Gtk.Label(label="Não perturbe"), False, False, 0)
+        self.chave_np = Gtk.Switch(active=notificacoes.nao_perturbe(), valign=Gtk.Align.CENTER)
+        self.chave_np.connect("notify::active", self.ao_nao_perturbe)
+        rodape.pack_start(self.chave_np, False, False, 0)
+        self.botao_limpar = Gtk.Button(label="Limpar")
+        self.botao_limpar.connect("clicked", self.ao_limpar)
+        rodape.pack_end(self.botao_limpar, False, False, 0)
+        col.pack_start(rodape, False, False, 0)
+
+        self.preencher_notificacoes()
+        notificacoes.marcar_vistas()
+        subprocess.Popen(["pkill", "-RTMIN+10", "waybar"])  # tira o ponto azul do relógio
+        return col
+
+    def preencher_notificacoes(self):
+        """(Re)desenha a lista de notificações, ou o aviso 'Nenhuma notificação'."""
+        for filho in self.lista_notif.get_children():
+            self.lista_notif.remove(filho)
+        itens = notificacoes.lista()
+        if not itens:
+            vazio = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, valign=Gtk.Align.CENTER)
+            vazio.set_margin_top(80)
+            img = Gtk.Image.new_from_icon_name("preferences-system-notifications-symbolic", Gtk.IconSize.DIALOG)
+            img.set_pixel_size(48)
+            img.set_opacity(0.35)
+            vazio.pack_start(img, False, False, 0)
+            rot = Gtk.Label(label="Nenhuma notificação")
+            rot.get_style_context().add_class("vazio")
+            vazio.pack_start(rot, False, False, 0)
+            linha = Gtk.ListBoxRow(activatable=False, selectable=False)
+            linha.get_style_context().add_class("sem-fundo")
+            linha.add(vazio)
+            self.lista_notif.add(linha)
+            prov = Gtk.CssProvider()
+            prov.load_from_data(b"row { background: transparent; }")
+            linha.get_style_context().add_provider(prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+        for n in itens:
+            self.lista_notif.add(self.linha_notificacao(n))
+        self.lista_notif.show_all()
+        if hasattr(self, "botao_limpar"):
+            self.botao_limpar.set_sensitive(bool(itens))
+
+    def linha_notificacao(self, n):
+        """Cria o cartão de uma notificação: ícone, app, título, texto e botão ×."""
+        row = Gtk.ListBoxRow()
+        row.notif = n
+        if n["urgencia"] >= 2:
+            row.get_style_context().add_class("urgente")
+        caixa = Gtk.Box(spacing=10)
+        caixa.pack_start(icone_notificacao(n), False, False, 0)
+        textos = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        app = Gtk.Label(label=n["app"] or "Notificação", xalign=0)
+        app.get_style_context().add_class("dim")
+        textos.pack_start(app, False, False, 0)
+        if n["titulo"]:
+            t = Gtk.Label(label=n["titulo"], xalign=0)
+            t.set_line_wrap(True)
+            t.set_max_width_chars(30)
+            t.get_style_context().add_class("notif-titulo")
+            textos.pack_start(t, False, False, 0)
+        if n["texto"]:
+            corpo = " ".join(n["texto"].split())
+            b = Gtk.Label(label=corpo, xalign=0)
+            b.set_line_wrap(True)
+            b.set_max_width_chars(30)
+            b.set_lines(3)
+            b.set_ellipsize(3)  # Pango.EllipsizeMode.END (texto completo no tooltip)
+            b.set_tooltip_text(n["texto"])
+            b.get_style_context().add_class("notif-texto")
+            textos.pack_start(b, False, False, 0)
+        caixa.pack_start(textos, True, True, 0)
+        fechar = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        fechar.get_style_context().add_class("fechar")
+        fechar.set_valign(Gtk.Align.START)
+        fechar.set_tooltip_text("Remover")
+        fechar.connect("clicked", lambda _b: self.remover_notificacao(n))
+        caixa.pack_end(fechar, False, False, 0)
+        row.add(caixa)
+        return row
+
+    def remover_notificacao(self, n):
+        """Esconde uma notificação da lista e a fecha no mako se ainda estiver na tela."""
+        notificacoes.ocultar(n["id"])
+        subprocess.run(["makoctl", "dismiss", "-n", str(n["id"])], capture_output=True)
+        self.preencher_notificacoes()
+
+    def ao_abrir_notificacao(self, _lista, row):
+        """Clique numa notificação: abre o app que a enviou."""
+        n = getattr(row, "notif", None)
+        if not n or not n["desktop"]:
+            return
+        subprocess.Popen(["gtk-launch", n["desktop"]], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.fechar()
+
+    def ao_limpar(self, _b):
+        """Botão Limpar: esconde todas as notificações atuais."""
+        notificacoes.limpar()
+        self.preencher_notificacoes()
+
+    def ao_nao_perturbe(self, chave, _p):
+        """Chave 'Não perturbe': usa a mesma função do app Configurações para ficarem sincronizados."""
+        try:
+            cfg = carregar_configuracoes()
+            estado = cfg.ler_estado()
+            estado["notificacoes"]["nao_perturbe"] = chave.get_active()
+            cfg.aplicar_mako(estado)
+        except Exception:
+            subprocess.run(["makoctl", "mode", "-s", "do-not-disturb" if chave.get_active() else "default"])
+        subprocess.Popen(["pkill", "-RTMIN+10", "waybar"])
+
+    def ir_para_hoje(self):
+        """Mostra o mês atual com o dia de hoje selecionado."""
+        hoje = GLib.DateTime.new_now_local()
+        self.cal.select_month(hoje.get_month() - 1, hoje.get_year())
+        self.cal.select_day(hoje.get_day_of_month())
+
+    def ao_mudar_mes(self, cal):
+        """Marca o dia de hoje e mostra o botão 'Hoje' só quando outro mês está visível."""
+        hoje = GLib.DateTime.new_now_local()
+        ano, mes, _dia = cal.get_date()
+        no_mes_atual = (ano == hoje.get_year() and mes == hoje.get_month() - 1)
+        cal.clear_marks()
+        if no_mes_atual:
+            cal.mark_day(hoje.get_day_of_month())
+        self.botao_hoje.set_opacity(0.0 if no_mes_atual else 1.0)
+        self.botao_hoje.set_sensitive(not no_mes_atual)
+
+    def ao_tecla(self, _w, ev):
+        """Esc fecha; Page Up/Page Down trocam de mês."""
+        if ev.keyval == Gdk.KEY_Escape:
+            self.fechar()
+            return True
+        if ev.keyval in (Gdk.KEY_Page_Up, Gdk.KEY_Page_Down):
+            ano, mes, _d = self.cal.get_date()
+            mes += -1 if ev.keyval == Gdk.KEY_Page_Up else 1
+            if mes < 0:
+                mes, ano = 11, ano - 1
+            elif mes > 11:
+                mes, ano = 0, ano + 1
+            self.cal.select_month(mes, ano)
+            return True
+        return False
+
+
+if __name__ == "__main__":
+    Calendario().run(None)

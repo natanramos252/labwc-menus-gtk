@@ -1,0 +1,21 @@
+/* Visual escuro da barra, combinando com os menus deste repositório. */
+* { font-family: sans-serif, FontAwesome; font-size: 13px; border: none; }
+window#waybar { background: rgba(20, 20, 30, 0.75); color: #ddd; }
+
+/* espaçamento dos módulos */
+#custom-apps, #custom-relogio, #network, #pulseaudio, #battery, #tray,
+#custom-dispositivos, #custom-power { padding: 0 10px; }
+#custom-apps { font-weight: bold; }
+
+/* destaque ao passar o mouse nos módulos clicáveis */
+#custom-apps:hover, #custom-relogio:hover, #pulseaudio:hover, #network:hover,
+#custom-dispositivos:hover, #custom-power:hover { background: rgba(255, 255, 255, 0.12); }
+
+/* relógio: texto branco com notificações novas, cinza no "não perturbe" */
+#custom-relogio.novas { color: #ffffff; }
+#custom-relogio.nao-perturbe { color: #b0b0be; }
+
+/* bateria e botão de energia */
+#battery.warning:not(.charging) { color: #e0af68; }
+#battery.critical:not(.charging) { color: #f7768e; }
+#custom-power { color: #f7768e; }
